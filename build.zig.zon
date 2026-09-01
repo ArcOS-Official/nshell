@@ -1,0 +1,25 @@
+.{
+    .name = .nshell,
+
+    .version = "0.1.0",
+
+    .fingerprint = 0x8c8a6910bfec4b,
+
+    .minimum_zig_version = "0.16.0",
+
+    .dependencies = .{
+        .dvui_layer_shell = .{
+            .url = "git+https://github.com/ArcOS-Official/dvui_layershell.git#e323b2f8313ac8a9d046f2e06818f4a3758278f0",
+            .hash = "dvui_layer_shell-0.1.0-evhuWEvIAACmMjJW7KHaHuCwnWwf2u0Exh7LSnhD89T-",
+        },
+        .dvui = .{
+            .url = "git+https://github.com/david-vanderson/dvui?ref=main#ecffdbf85beea10e9cbabcb370c60619b75e4282",
+            .hash = "dvui-0.5.0-dev-AQFJmWfx-wBObpJ1cR37uegD8XexNPqnhOI41jPAOYcY",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
