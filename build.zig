@@ -26,8 +26,12 @@ pub fn build(b: *std.Build) void {
         .backend = .sdl3,
     });
     const ls_dep = b.dependency("dvui_layer_shell", .{ .target = target, .optimize = optimize });
+    const nilebank_dep = b.dependency("nilebank", .{
+        .target = target,
+    });
     exe.root_module.addImport("dvui", dvui_dep.module("dvui_sdl3"));
     exe.root_module.addImport("layershell", ls_dep.module("dvui-layer-shell"));
+    exe.root_module.addImport("nilebank", nilebank_dep.module("nilebank"));
 
     b.installArtifact(exe);
 
