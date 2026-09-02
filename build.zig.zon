@@ -9,8 +9,8 @@
 
     .dependencies = .{
         .dvui_layer_shell = .{
-            .url = "git+https://github.com/ArcOS-Official/dvui_layershell.git#e323b2f8313ac8a9d046f2e06818f4a3758278f0",
-            .hash = "dvui_layer_shell-0.1.0-evhuWEvIAACmMjJW7KHaHuCwnWwf2u0Exh7LSnhD89T-",
+            .url = "git+https://github.com/ArcOS-Official/dvui_layershell.git#111d77ac812bea08ce29886b3caa027d0b13b610",
+            .hash = "dvui_layer_shell-0.1.0-evhuWLTFAADENzw55rNdeiLbMqZQ1n4PpeMyR1aYmPeH",
         },
         .dvui = .{
             .url = "git+https://github.com/david-vanderson/dvui?ref=main#ecffdbf85beea10e9cbabcb370c60619b75e4282",
