@@ -160,6 +160,14 @@ stream_conn: ?nilebank.Connection = null,
 next_stream_ms: i64 = 0,
 stream_path_override: ?[]const u8 = null,
 
+// Live request-connection stream, published by the worker under req_mu.
+// deinit calls shutdown() on it (never close()) to unblock a worker parked
+// in a reply recv() on a wedged compositor, then joins. Sole close()
+// ownership stays with the worker, which clears this slot under the same
+// lock whenever it drops the connection: no double-close, no fd-reuse.
+req_mu: std.Io.Mutex = .init,
+req_stream: ?std.Io.net.Stream = null,
+
 // UI-thread copies. Only touched by the UI thread: published by the worker
 // via inbox snapshots applied in poll(), read directly by the frame.
 workspaces: []proto.Workspace = &.{},
@@ -235,6 +243,12 @@ pub fn initWithWakeup(self: *State, wakeup_ctx: ?*anyopaque, wakeup_fn: ?WakeupF
     self.reader = null;
     self.stream_conn = null;
     self.next_stream_ms = 0;
+    // Explicit init: callers may declare `var state: State = undefined`,
+    // which leaves even defaulted fields (like these mutexes) undefined.
+    // The worker only runs after spawn, so plain stores here are race-free.
+    self.stream_mu = .init;
+    self.req_mu = .init;
+    self.req_stream = null;
     // Stored before the worker spawns, read-only afterwards: no race.
     self.wakeup_ctx = wakeup_ctx;
     self.wakeup_fn = wakeup_fn;
@@ -253,6 +267,13 @@ pub fn initWithWakeup(self: *State, wakeup_ctx: ?*anyopaque, wakeup_fn: ?WakeupF
 pub fn deinit(self: *State) void {
     if (self.thread) |t| {
         self.stop.store(true, .seq_cst);
+        // Unblock a worker parked in a reply recv() on a wedged compositor:
+        // shutdown() the live request stream (never close() it — sole close
+        // ownership stays with the worker) so the in-flight request fails
+        // fast instead of hanging the join below forever.
+        self.req_mu.lockUncancelable(self.io);
+        if (self.req_stream) |*s| s.shutdown(self.io, .both) catch {};
+        self.req_mu.unlock(self.io);
         t.join();
         self.thread = null;
     }
@@ -495,15 +516,39 @@ const Worker = struct {
     model_outs: []proto.Output = &.{},
 
     fn deinit(self: *Worker) void {
-        if (self.conn) |*c| {
-            c.close();
-            self.conn = null;
-        }
+        // dropConn also clears the published stream so a later deinit can't
+        // shutdown a stale (possibly recycled) fd.
+        self.dropConn();
         if (self.override_path) |p| {
             self.st.alloc.free(p);
             self.override_path = null;
         }
         self.freeModel();
+    }
+
+    // Single choke point for adopting a fresh connection: publishes its
+    // stream so deinit can shutdown-to-unblock it.
+    fn setConn(self: *Worker, c: nilebank.Connection) void {
+        self.conn = c;
+        self.st.req_mu.lockUncancelable(self.st.io);
+        defer self.st.req_mu.unlock(self.st.io);
+        self.st.req_stream = c.conn;
+    }
+
+    // Single choke point for dropping the connection. Close and clear happen
+    // atomically w.r.t. deinit's shutdown: deinit can neither miss a live
+    // connection nor hit a recycled fd. shutdown() first makes the close
+    // frame's write fail fast instead of blocking on a wedged peer while
+    // holding req_mu (req_mu is never held across reads, the wedge point).
+    fn dropConn(self: *Worker) void {
+        self.st.req_mu.lockUncancelable(self.st.io);
+        defer self.st.req_mu.unlock(self.st.io);
+        if (self.conn) |*c| {
+            c.conn.shutdown(self.st.io, .both) catch {};
+            c.close();
+            self.conn = null;
+        }
+        self.st.req_stream = null;
     }
 
     fn freeModel(self: *Worker) void {
@@ -551,8 +596,7 @@ const Worker = struct {
     fn sendOnConn(self: *Worker, req: proto.Request) void {
         const c = if (self.conn) |*c| c else return;
         const ev = req.send(c, .{ .encoding = .raw }) catch {
-            c.close();
-            self.conn = null;
+            self.dropConn();
             self.next_reconnect_ms = self.st.nowMs() + 800;
             return;
         };
@@ -569,10 +613,7 @@ const Worker = struct {
                     if (self.override_path) |old| self.st.alloc.free(old);
                     self.override_path = self.st.alloc.dupe(u8, p) catch null;
                     // reconnect to the new path immediately
-                    if (self.conn) |*c| {
-                        c.close();
-                        self.conn = null;
-                    }
+                    self.dropConn();
                     self.next_reconnect_ms = 0;
                 },
                 .switch_workspace => |id| self.sendOnConn(.{ .switch_workspace = .{ .id = id } }),
@@ -590,18 +631,18 @@ const Worker = struct {
         // Explicit override first, then env, then canonical compositor socket.
         if (self.override_path) |p| {
             if (nilebank.Connection.initPath(self.st.alloc, self.st.io, p)) |c| {
-                self.conn = c;
+                self.setConn(c);
                 return;
             } else |_| {}
         }
         if (getEnv("NILE_SOCKET")) |p| {
             if (nilebank.Connection.initPath(self.st.alloc, self.st.io, p)) |c| {
-                self.conn = c;
+                self.setConn(c);
                 return;
             } else |_| {}
         }
         if (nilebank.Connection.init(self.st.alloc, self.st.io, "compositor")) |c| {
-            self.conn = c;
+            self.setConn(c);
             return;
         } else |_| {}
 
@@ -612,8 +653,7 @@ const Worker = struct {
         const c = if (self.conn) |*c| c else return null;
         const ev = req.send(c, .{ .encoding = enc }) catch |err| {
             std.log.debug("nile request {s} failed: {}", .{ @tagName(req), err });
-            c.close();
-            self.conn = null;
+            self.dropConn();
             self.next_reconnect_ms = self.st.nowMs() + 800;
             return null;
         };

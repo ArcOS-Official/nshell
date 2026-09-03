@@ -524,3 +524,71 @@ test "state: worker wakeup fires when a snapshot is pushed" {
     try t.expect(state.connected);
     try t.expect(wakeup_count.load(.seq_cst) > 0);
 }
+
+// ---------------------------------------------------------------------------
+// Wedged-compositor shutdown: the server accepts and reads the request but
+// never replies, so the worker parks in recv(). deinit must still return
+// instead of hanging in the worker join (the "zombie threads" hang).
+// ---------------------------------------------------------------------------
+
+const wedged_test_path = "/tmp/nshell-wedged-test.sock";
+
+var wedged_stop = std.atomic.Value(bool).init(false);
+var wedged_accepted = std.atomic.Value(bool).init(false);
+
+fn wedgedServerMain(io: std.Io, path: []const u8) void {
+    const addr = std.Io.net.UnixAddress.init(path) catch return;
+    var server = addr.listen(io, .{}) catch return;
+    defer server.deinit(io);
+    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+    var client = server.accept(io) catch return;
+    defer client.close(io);
+    wedged_accepted.store(true, .seq_cst);
+    // Drain the request header so the worker moves past send and parks in
+    // recv(); then never reply.
+    var buf: [4096]u8 = undefined;
+    var r = client.reader(io, &buf);
+    var hdr: [nilebank.Header.size]u8 = undefined;
+    r.interface.readSliceAll(&hdr) catch {};
+    while (!wedged_stop.load(.seq_cst)) {
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+}
+
+test "state: deinit returns while worker is parked on a wedged compositor" {
+    const t = std.testing;
+    const alloc = t.allocator;
+    const io = t.io;
+    test_alloc = alloc;
+    test_poll_count = 0;
+    test_req_empty = false;
+    wedged_stop.store(false, .seq_cst);
+    wedged_accepted.store(false, .seq_cst);
+    std.Io.Dir.deleteFileAbsolute(io, wedged_test_path) catch {};
+
+    const server = try std.Thread.spawn(.{}, wedgedServerMain, .{ io, wedged_test_path });
+    // Joined at the end; reaching the join proves deinit returned.
+
+    var state = State{};
+    state.stream_path_override = "/tmp/nshell-no-stream.sock";
+    try state.init();
+    // No defer deinit: returning from deinit is itself the assertion.
+
+    state.connectTo(wedged_test_path);
+
+    // Wait until the server holds the request: the worker is parked in recv().
+    var tries: usize = 0;
+    while (!wedged_accepted.load(.seq_cst) and tries < 500) : (tries += 1) {
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try t.expect(wedged_accepted.load(.seq_cst));
+    // Settle past send into the blocking recv.
+    io.sleep(.fromMilliseconds(500), .awake) catch {};
+
+    // Must return even though the compositor never replies.
+    state.deinit();
+
+    wedged_stop.store(true, .seq_cst);
+    server.join();
+    std.Io.Dir.deleteFileAbsolute(io, wedged_test_path) catch {};
+}
