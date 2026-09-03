@@ -9,6 +9,9 @@ var test_focus_window_id: ?u64 = null;
 var test_close_window_id: ?u64 = null;
 var test_poll_count: usize = 0;
 var test_fetch_count: usize = 0;
+// When true the fake answers all list queries with empty lists (the stream
+// test serves real data over the push socket instead).
+var test_req_empty: bool = false;
 
 fn fakeCompositorCallback(msg: nilebank.Message) anyerror!nilebank.Message {
     const alloc = test_alloc;
@@ -18,7 +21,7 @@ fn fakeCompositorCallback(msg: nilebank.Message) anyerror!nilebank.Message {
     const resp: proto.Event = switch (req) {
         .list_workspaces => blk: {
             test_fetch_count += 1;
-            if (test_poll_count > 0) {
+            if (test_req_empty or test_poll_count > 0) {
                 break :blk .{ .workspaces = .{ .items = &.{} } };
             }
             const ws = try alloc.alloc(proto.Workspace, 2);
@@ -43,7 +46,7 @@ fn fakeCompositorCallback(msg: nilebank.Message) anyerror!nilebank.Message {
             break :blk .{ .workspaces = .{ .items = ws } };
         },
         .list_windows => blk: {
-            if (test_poll_count > 0) {
+            if (test_req_empty or test_poll_count > 0) {
                 break :blk .{ .windows = .{ .items = &.{} } };
             }
             const wins = try alloc.alloc(proto.Window, 1);
@@ -63,7 +66,7 @@ fn fakeCompositorCallback(msg: nilebank.Message) anyerror!nilebank.Message {
             break :blk .{ .windows = .{ .items = wins } };
         },
         .list_outputs => blk: {
-            if (test_poll_count > 0) {
+            if (test_req_empty or test_poll_count > 0) {
                 break :blk .{ .outputs = .{ .items = &.{} } };
             }
             const outs = try alloc.alloc(proto.Output, 1);
@@ -318,6 +321,7 @@ fn sendStreamEvent(stream: std.Io.net.Stream, io: std.Io, ev: proto.Event) !void
 }
 
 fn streamAcceptorMain(io: std.Io, path: []const u8) void {
+    const alloc = test_alloc;
     const addr = std.Io.net.UnixAddress.init(path) catch return;
     var server = addr.listen(io, .{}) catch return;
     defer server.deinit(io);
@@ -325,31 +329,91 @@ fn streamAcceptorMain(io: std.Io, path: []const u8) void {
     var client = server.accept(io) catch return;
     defer client.close(io);
     stream_accepted.store(true, .seq_cst);
-    // Catch-up snapshots, like the real Bank sends on connect.
-    sendStreamEvent(client, io, .{ .windows_snapshot = .{ .items = &.{} } }) catch return;
-    sendStreamEvent(client, io, .{ .workspaces_snapshot = .{ .items = &.{} } }) catch return;
-    sendStreamEvent(client, io, .{ .outputs_snapshot = .{ .items = &.{} } }) catch return;
+    // Catch-up snapshots with real data, like the real Bank sends.
+    // The request fake answers EMPTY below, so anything the UI shows
+    // must have come straight from these pushes.
+    {
+        const wins = alloc.alloc(proto.Window, 1) catch return;
+        wins[0] = .{
+            .id = 100,
+            .title = alloc.dupe(u8, "main.zig - nvim") catch return,
+            .app_id = alloc.dupe(u8, "nvim") catch return,
+            .workspace = 10,
+            .output = 1,
+            .pid = 12345,
+            .rect = .{ .x = 0, .y = 0, .width = 1920, .height = 1080 },
+            .floating = false,
+            .fullscreen = false,
+            .focused = true,
+            .urgent = false,
+        };
+        sendStreamEvent(client, io, .{ .windows_snapshot = .{ .items = wins } }) catch return;
+    }
+    {
+        const ws = alloc.alloc(proto.Workspace, 2) catch return;
+        ws[0] = .{
+            .id = 10,
+            .number = 1,
+            .name = alloc.dupe(u8, "main") catch return,
+            .active = true,
+            .current = true,
+            .urgent = false,
+            .output = 1,
+        };
+        ws[1] = .{
+            .id = 20,
+            .number = 2,
+            .name = alloc.dupe(u8, "code") catch return,
+            .active = false,
+            .current = false,
+            .urgent = true,
+            .output = 1,
+        };
+        sendStreamEvent(client, io, .{ .workspaces_snapshot = .{ .items = ws } }) catch return;
+    }
+    {
+        const outs = alloc.alloc(proto.Output, 1) catch return;
+        outs[0] = .{
+            .id = 1,
+            .name = alloc.dupe(u8, "eDP-1") catch return,
+            .make = alloc.dupe(u8, "LG") catch return,
+            .model = alloc.dupe(u8, "Display") catch return,
+            .x = 0,
+            .y = 0,
+            .mode = .{ .width = 2560, .height = 1440, .refresh = 60000 },
+            .scale = 1000,
+            .enabled = true,
+        };
+        sendStreamEvent(client, io, .{ .outputs_snapshot = .{ .items = outs } }) catch return;
+    }
     while (stream_phase.load(.seq_cst) < 1) {
         io.sleep(.fromMilliseconds(5), .awake) catch {};
     }
-    sendStreamEvent(client, io, .{ .workspace_activated = .{ .id = 10 } }) catch return;
+    // Incremental events: applied straight into the model, no re-query.
+    sendStreamEvent(client, io, .{
+        .window_title_changed = .{ .id = 100, .title = alloc.dupe(u8, "hello") catch return },
+    }) catch return;
+    sendStreamEvent(client, io, .{
+        .new_window = .{ .id = 101, .title = alloc.dupe(u8, "fresh") catch return },
+    }) catch return;
     stream_phase.store(2, .seq_cst);
     while (stream_phase.load(.seq_cst) < 3) {
         io.sleep(.fromMilliseconds(5), .awake) catch {};
     }
 }
 
-test "state: event stream drives refetch, fallback when down" {
+test "state: pushed events update UI with no follow-up query" {
     const t = std.testing;
     const alloc = t.allocator;
     const io = t.io;
     test_alloc = alloc;
     test_poll_count = 0;
     test_fetch_count = 0;
+    test_req_empty = true;
     stream_accepted.store(false, .seq_cst);
     stream_phase.store(0, .seq_cst);
 
-    // Request/response fake (also counts fetches).
+    // Request/response fake answers EMPTY and counts fetches.
     const path = "/tmp/nshell-stream-req-test.sock";
     const server = try nilebank.servePath(alloc, io, path, fakeCompositorCallback);
     defer server.deinit();
@@ -369,7 +433,7 @@ test "state: event stream drives refetch, fallback when down" {
 
     state.connectTo(path);
 
-    // Wait for the stream accept and the first synced snapshot.
+    // The request side is empty, so synced data can only come from pushes.
     var tries: usize = 0;
     while ((!stream_accepted.load(.seq_cst) or state.workspaces.len != 2) and tries < 1000) : (tries += 1) {
         state.poll();
@@ -377,9 +441,10 @@ test "state: event stream drives refetch, fallback when down" {
     }
     try t.expect(stream_accepted.load(.seq_cst));
     try t.expectEqual(@as(usize, 2), state.workspaces.len);
+    try t.expectEqual(@as(usize, 1), state.windows.len);
+    try t.expectEqual(@as(usize, 1), state.outputs.len);
 
-    // Settle, then assert the worker is idle while the stream is quiet:
-    // no periodic polling means no new fetches.
+    // Settle, then assert the worker is idle while the stream is quiet.
     tries = 0;
     while (tries < 30) : (tries += 1) {
         state.poll();
@@ -393,23 +458,69 @@ test "state: event stream drives refetch, fallback when down" {
     }
     try t.expectEqual(c0, test_fetch_count);
 
-    // Push one event: the worker must re-query promptly.
+    // Push incremental events: UI must update with zero new fetches.
     stream_phase.store(1, .seq_cst);
     tries = 0;
-    while (test_fetch_count == c0 and tries < 500) : (tries += 1) {
+    while (tries < 500) : (tries += 1) {
         state.poll();
+        const fw = state.focusedWindow();
+        if (fw != null and std.mem.eql(u8, fw.?.title, "hello") and state.windows.len == 2) break;
         io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
-    try t.expect(test_fetch_count > c0);
-    try t.expectEqual(@as(usize, 2), state.workspaces.len);
+    {
+        const fw = state.focusedWindow();
+        try t.expect(fw != null);
+        try t.expectEqualStrings("hello", fw.?.title);
+    }
+    try t.expectEqual(@as(usize, 2), state.windows.len);
+    try t.expectEqual(c0, test_fetch_count);
 
-    // Drop the stream: fallback polling must resume.
+    // Drop the stream: fallback polling must resume (req side is empty,
+    // so the UI clears as fallback refetches).
     const c1 = test_fetch_count;
     stream_phase.store(3, .seq_cst);
     tries = 0;
-    while (test_fetch_count < c1 + 2 and tries < 500) : (tries += 1) {
+    while ((test_fetch_count < c1 + 2 or state.workspaces.len != 0) and tries < 500) : (tries += 1) {
         state.poll();
         io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
     try t.expect(test_fetch_count >= c1 + 2);
+    try t.expectEqual(@as(usize, 0), state.workspaces.len);
+}
+
+var wakeup_count = std.atomic.Value(usize).init(0);
+
+fn testWakeup(_: ?*anyopaque) void {
+    _ = wakeup_count.fetchAdd(1, .seq_cst);
+}
+
+test "state: worker wakeup fires when a snapshot is pushed" {
+    const t = std.testing;
+    const alloc = t.allocator;
+    const io = t.io;
+    test_alloc = alloc;
+    test_poll_count = 0;
+    test_req_empty = false;
+    wakeup_count.store(0, .seq_cst);
+
+    const path = "/tmp/nshell-wakeup-test.sock";
+
+    const server = try nilebank.servePath(alloc, io, path, fakeCompositorCallback);
+    defer server.deinit();
+
+    var state = State{};
+    state.stream_path_override = "/tmp/nshell-no-stream.sock";
+    try state.initWithWakeup(null, &testWakeup);
+    defer state.deinit();
+
+    state.connectTo(path);
+
+    var tries: usize = 0;
+    while (tries < 1000) : (tries += 1) {
+        state.poll();
+        if (state.connected and state.workspaces.len == 2) break;
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try t.expect(state.connected);
+    try t.expect(wakeup_count.load(.seq_cst) > 0);
 }

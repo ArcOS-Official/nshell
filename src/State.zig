@@ -116,11 +116,10 @@ fn DeferredQueue(comptime T: type) type {
 // arrives as an event and triggers a re-query, so no polling is needed while
 // the stream is up. Periodic polling remains only as fallback while down.
 const stream_path = "/tmp/arcos/compositor-events.sock";
-const stream_cooldown_ms: i64 = 50;
 const stream_backoff_ms: i64 = 1500;
 // Safety re-sync while the stream is up: bounds staleness if the server
 // ever mutates state without broadcasting (or a message is dropped).
-const stream_resync_ms: i64 = 2000;
+const stream_resync_ms: i64 = 10000;
 const stream_max_frame: usize = 16 * 1024 * 1024;
 
 const StreamMsg = union(enum) {
@@ -167,6 +166,16 @@ workspaces: []proto.Workspace = &.{},
 windows: []proto.Window = &.{},
 outputs: []proto.Output = &.{},
 
+// Wakeup hook: the UI thread registers a callback (plus opaque context)
+// before init(); the worker invokes it every time it pushes a snapshot into
+// the inbox so the GUI thread wakes up and draws a new frame. Decoupled from
+// dvui so State stays testable without GUI deps; main.zig wires it to
+// dvui.refresh(window), which pushes an SDL user event that interrupts the
+// backend's waitEventTimeout. Stored in init() before the worker spawns and
+// read-only afterwards, so there is no race.
+wakeup_ctx: ?*anyopaque = null,
+wakeup_fn: ?WakeupFn = null,
+
 connected: bool = false,
 focused_id: ?u64 = null,
 drain_pending: bool = false,
@@ -181,6 +190,12 @@ status_text: []const u8 = "disconnected",
 
 const fetch_every_ms: i64 = 220;
 const loop_sleep_ms: u64 = 25;
+
+pub const WakeupFn = *const fn (?*anyopaque) void;
+
+fn requestRefresh(self: *State) void {
+    if (self.wakeup_fn) |f| f(self.wakeup_ctx);
+}
 
 fn nowMs(_: *State) i64 {
     var ts: std.os.linux.timespec = undefined;
@@ -197,6 +212,10 @@ fn realtimeSec() i64 {
 }
 
 pub fn init(self: *State) !void {
+    try self.initWithWakeup(null, null);
+}
+
+pub fn initWithWakeup(self: *State, wakeup_ctx: ?*anyopaque, wakeup_fn: ?WakeupFn) !void {
     self.alloc = std.heap.smp_allocator;
     self.threaded = std.Io.Threaded.init(self.alloc, .{});
     self.io = self.threaded.io();
@@ -216,6 +235,9 @@ pub fn init(self: *State) !void {
     self.reader = null;
     self.stream_conn = null;
     self.next_stream_ms = 0;
+    // Stored before the worker spawns, read-only afterwards: no race.
+    self.wakeup_ctx = wakeup_ctx;
+    self.wakeup_fn = wakeup_fn;
     self.inited = true;
     self.updateClock();
     errdefer {
@@ -234,6 +256,9 @@ pub fn deinit(self: *State) void {
         t.join();
         self.thread = null;
     }
+    // Worker is gone: drop the wakeup so no stale window pointer remains.
+    self.wakeup_fn = null;
+    self.wakeup_ctx = null;
     self.inbox.deinit();
     self.outbox.deinit();
     self.streamQ.deinit();
@@ -356,6 +381,11 @@ fn getEnv(key: []const u8) ?[]const u8 {
 
 // UI thread: never connects or blocks on IPC. Drains published snapshots
 // (non-blocking) and updates the local clock.
+//
+// On inbox contention the drain is deferred and a refresh is requested via
+// the wakeup hook so the retry happens on the next frame. Fresh pushes from
+// the worker already wake the GUI the same way, so applied snapshots need no
+// extra refresh: the current frame draws them.
 pub fn poll(self: *State) void {
     const now = self.nowMs();
     // throttle to ~4Hz plus clock at 1Hz
@@ -365,9 +395,11 @@ pub fn poll(self: *State) void {
     defer tmp.deinit(self.alloc);
     if (!self.inbox.popAll(&tmp)) {
         self.drain_pending = true;
+        self.requestRefresh();
         return;
     }
     self.drain_pending = false;
+    const reqf = (tmp.items.len != 0);
     for (tmp.items) |s| {
         self.freeWorkspaces();
         self.freeWindows();
@@ -378,7 +410,9 @@ pub fn poll(self: *State) void {
         self.connected = s.connected;
         self.status_text = if (s.connected) "connected" else "disconnected";
     }
-    if (tmp.items.len == 0) return;
+    if (!reqf) {
+        return;
+    }
     // derive focused id
     self.focused_id = null;
     for (self.windows) |w| if (w.focused) {
@@ -454,6 +488,12 @@ const Worker = struct {
     next_reconnect_ms: i64 = 0,
     last_fetch_ms: i64 = 0,
 
+    // Worker-side model. Pushed stream events apply here directly, so the UI
+    // updates without any follow-up query; the inbox always receives clones.
+    model_ws: []proto.Workspace = &.{},
+    model_wins: []proto.Window = &.{},
+    model_outs: []proto.Output = &.{},
+
     fn deinit(self: *Worker) void {
         if (self.conn) |*c| {
             c.close();
@@ -463,6 +503,49 @@ const Worker = struct {
             self.st.alloc.free(p);
             self.override_path = null;
         }
+        self.freeModel();
+    }
+
+    fn freeModel(self: *Worker) void {
+        const alloc = self.st.alloc;
+        for (self.model_ws) |*ws| ws.deinit(alloc);
+        if (self.model_ws.len > 0) alloc.free(self.model_ws);
+        self.model_ws = &.{};
+        for (self.model_wins) |*w| w.deinit(alloc);
+        if (self.model_wins.len > 0) alloc.free(self.model_wins);
+        self.model_wins = &.{};
+        for (self.model_outs) |*o| o.deinit(alloc);
+        if (self.model_outs.len > 0) alloc.free(self.model_outs);
+        self.model_outs = &.{};
+    }
+
+    // Publish a clone of the model; the worker keeps its own copies.
+    // Wakes the GUI thread so the snapshot is drawn on the next frame
+    // instead of sitting in the inbox while the backend sleeps in
+    // waitEventTimeout.
+    fn publishModel(self: *Worker) void {
+        const alloc = self.st.alloc;
+        const snap = Snapshot{
+            .workspaces = cloneItems(proto.Workspace, cloneWorkspace, alloc, self.model_ws) catch &.{},
+            .windows = cloneItems(proto.Window, cloneWindow, alloc, self.model_wins) catch &.{},
+            .outputs = cloneItems(proto.Output, cloneOutput, alloc, self.model_outs) catch &.{},
+            .connected = self.conn != null or self.st.reader != null,
+        };
+        self.st.inbox.push(snap);
+        self.st.requestRefresh();
+    }
+
+    // Adopt a fetched snapshot as the new model, then publish a clone.
+    // Afterwards the snapshot owns nothing.
+    fn adoptSnapshot(self: *Worker, snap: *Snapshot) void {
+        self.freeModel();
+        self.model_ws = snap.workspaces;
+        self.model_wins = snap.windows;
+        self.model_outs = snap.outputs;
+        snap.workspaces = &.{};
+        snap.windows = &.{};
+        snap.outputs = &.{};
+        self.publishModel();
     }
 
     fn sendOnConn(self: *Worker, req: proto.Request) void {
@@ -579,6 +662,266 @@ const Worker = struct {
         }
         return snap;
     }
+
+    fn findWindow(self: *Worker, id: u64) ?*proto.Window {
+        for (self.model_wins) |*w| if (w.id == id) return w;
+        return null;
+    }
+
+    // Order-preserving remove from a model list. The caller deinits the
+    // removed item first.
+    fn removeAt(comptime T: type, alloc: std.mem.Allocator, items: *[]T, i: usize) void {
+        var s: []T = items.*;
+        std.mem.copyForwards(T, s[i .. s.len - 1], s[i + 1 ..]);
+        if (s.len - 1 == 0) {
+            alloc.free(s);
+            items.* = &.{};
+        } else {
+            items.* = alloc.realloc(s, s.len - 1) catch s[0 .. s.len - 1];
+        }
+    }
+
+    fn removeWindow(self: *Worker, id: u64) bool {
+        for (self.model_wins, 0..) |*w, i| {
+            if (w.id != id) continue;
+            w.deinit(self.st.alloc);
+            removeAt(proto.Window, self.st.alloc, &self.model_wins, i);
+            return true;
+        }
+        return false;
+    }
+
+    fn removeWorkspace(self: *Worker, id: u64) bool {
+        for (self.model_ws, 0..) |*ws, i| {
+            if (ws.id != id) continue;
+            ws.deinit(self.st.alloc);
+            removeAt(proto.Workspace, self.st.alloc, &self.model_ws, i);
+            return true;
+        }
+        return false;
+    }
+
+    fn removeOutput(self: *Worker, id: u64) bool {
+        for (self.model_outs, 0..) |*o, i| {
+            if (o.id != id) continue;
+            o.deinit(self.st.alloc);
+            removeAt(proto.Output, self.st.alloc, &self.model_outs, i);
+            return true;
+        }
+        return false;
+    }
+
+    fn upsertWorkspace(self: *Worker, ws: proto.Workspace) !void {
+        const alloc = self.st.alloc;
+        for (self.model_ws) |*cur| {
+            if (cur.id != ws.id) continue;
+            cur.deinit(alloc);
+            cur.* = try cloneWorkspace(alloc, ws);
+            return;
+        }
+        self.model_ws = try alloc.realloc(self.model_ws, self.model_ws.len + 1);
+        errdefer self.model_ws = alloc.realloc(self.model_ws, self.model_ws.len - 1) catch self.model_ws;
+        self.model_ws[self.model_ws.len - 1] = try cloneWorkspace(alloc, ws);
+    }
+
+    fn upsertOutput(self: *Worker, o: proto.Output) !void {
+        const alloc = self.st.alloc;
+        for (self.model_outs) |*cur| {
+            if (cur.id != o.id) continue;
+            cur.deinit(alloc);
+            cur.* = try cloneOutput(alloc, o);
+            return;
+        }
+        self.model_outs = try alloc.realloc(self.model_outs, self.model_outs.len + 1);
+        errdefer self.model_outs = alloc.realloc(self.model_outs, self.model_outs.len - 1) catch self.model_outs;
+        self.model_outs[self.model_outs.len - 1] = try cloneOutput(alloc, o);
+    }
+
+    // Precise fill-in for a window we only know by id (e.g. new_window
+    // carries just id+title). No-ops without a request connection.
+    fn fillWindow(self: *Worker, id: u64) void {
+        if (self.requestTyped(.{ .get_window = .{ .id = id } }, .raw)) |ev| {
+            defer ev.deinit(self.st.alloc);
+            if (ev != .windows) return;
+            if (ev.windows.items.len == 0) return;
+            self.adoptWindow(&ev.windows.items[0]) catch {};
+        }
+    }
+
+    // Steal one decoded window record into the model. The caller must not
+    // use the source afterwards; its strings are neutralized so the
+    // event deinit stays safe.
+    fn adoptWindow(self: *Worker, w: *proto.Window) !void {
+        const alloc = self.st.alloc;
+        for (self.model_wins) |*cur| {
+            if (cur.id != w.id) continue;
+            cur.deinit(alloc);
+            cur.* = w.*;
+            w.title = "";
+            w.app_id = "";
+            return;
+        }
+        self.model_wins = try alloc.realloc(self.model_wins, self.model_wins.len + 1);
+        errdefer self.model_wins = alloc.realloc(self.model_wins, self.model_wins.len - 1) catch self.model_wins;
+        self.model_wins[self.model_wins.len - 1] = w.*;
+        w.title = "";
+        w.app_id = "";
+    }
+
+    // Apply one pushed event to the model. Returns true when the UI-visible
+    // state changed. Unknown ids trigger a get_window fill-in so a missed
+    // new_window still converges without any extra follow-up.
+    fn applyStreamEvent(self: *Worker, ev: *proto.Event) bool {
+        const alloc = self.st.alloc;
+        switch (ev.*) {
+            .windows_snapshot, .windows => {
+                self.freeModelWindows();
+                if (ev.* == .windows_snapshot) {
+                    self.model_wins = ev.windows_snapshot.items;
+                    ev.windows_snapshot.items = &.{};
+                } else {
+                    self.model_wins = ev.windows.items;
+                    ev.windows.items = &.{};
+                }
+                return true;
+            },
+            .workspaces_snapshot, .workspaces => {
+                self.freeModelWorkspaces();
+                if (ev.* == .workspaces_snapshot) {
+                    self.model_ws = ev.workspaces_snapshot.items;
+                    ev.workspaces_snapshot.items = &.{};
+                } else {
+                    self.model_ws = ev.workspaces.items;
+                    ev.workspaces.items = &.{};
+                }
+                return true;
+            },
+            .outputs_snapshot, .outputs => {
+                self.freeModelOutputs();
+                if (ev.* == .outputs_snapshot) {
+                    self.model_outs = ev.outputs_snapshot.items;
+                    ev.outputs_snapshot.items = &.{};
+                } else {
+                    self.model_outs = ev.outputs.items;
+                    ev.outputs.items = &.{};
+                }
+                return true;
+            },
+            .new_window => |v| {
+                if (self.findWindow(v.id)) |rec| {
+                    if (v.title.len > 0) {
+                        if (rec.title.len > 0) alloc.free(rec.title);
+                        rec.title = alloc.dupe(u8, v.title) catch "";
+                    }
+                } else {
+                    self.model_wins = alloc.realloc(self.model_wins, self.model_wins.len + 1) catch return true;
+                    self.model_wins[self.model_wins.len - 1] = .{ .id = v.id };
+                    const rec = &self.model_wins[self.model_wins.len - 1];
+                    rec.title = if (v.title.len > 0) alloc.dupe(u8, v.title) catch "" else "";
+                    rec.app_id = "";
+                }
+                self.fillWindow(v.id);
+                return true;
+            },
+            .window_closed => |v| return self.removeWindow(v.id),
+            .window_focused => |v| {
+                for (self.model_wins) |*w| w.focused = (w.id == v.id);
+                return true;
+            },
+            .window_title_changed => |v| {
+                if (self.findWindow(v.id)) |rec| {
+                    if (rec.title.len > 0) alloc.free(rec.title);
+                    rec.title = if (v.title.len > 0) alloc.dupe(u8, v.title) catch "" else "";
+                    return true;
+                }
+                self.fillWindow(v.id);
+                return true;
+            },
+            .window_app_id_changed => |v| {
+                if (self.findWindow(v.id)) |rec| {
+                    if (rec.app_id.len > 0) alloc.free(rec.app_id);
+                    rec.app_id = if (v.app_id.len > 0) alloc.dupe(u8, v.app_id) catch "" else "";
+                    return true;
+                }
+                self.fillWindow(v.id);
+                return true;
+            },
+            .window_state_changed => |v| {
+                if (self.findWindow(v.id)) |rec| {
+                    rec.floating = v.floating;
+                    rec.fullscreen = v.fullscreen;
+                    rec.urgent = v.urgent;
+                    rec.focused = v.focused;
+                    return true;
+                }
+                self.fillWindow(v.id);
+                return true;
+            },
+            .window_workspace_changed => |v| {
+                if (self.findWindow(v.id)) |rec| {
+                    rec.workspace = v.new_workspace;
+                    return true;
+                }
+                self.fillWindow(v.id);
+                return true;
+            },
+            .window_moved, .window_resized => |v| {
+                if (self.findWindow(v.id)) |rec| {
+                    rec.rect = v.rect;
+                    return true;
+                }
+                self.fillWindow(v.id);
+                return true;
+            },
+            .new_output, .output_added, .output_changed => |v| {
+                self.upsertOutput(v) catch {};
+                return true;
+            },
+            .output_removed => |v| return self.removeOutput(v.id),
+            .workspace_created => |v| {
+                self.upsertWorkspace(v) catch {};
+                return true;
+            },
+            .workspace_removed => |v| return self.removeWorkspace(v.id),
+            .workspace_activated => |v| {
+                for (self.model_ws) |*ws| ws.current = (ws.id == v.id);
+                return true;
+            },
+            .workspace_deactivated => |v| {
+                for (self.model_ws) |*ws| if (ws.id == v.id) {
+                    ws.current = false;
+                    return true;
+                };
+                return false;
+            },
+            .switch_workspace => |v| {
+                for (self.model_ws) |*ws| ws.current = (ws.number == v.index);
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    fn freeModelWindows(self: *Worker) void {
+        const alloc = self.st.alloc;
+        for (self.model_wins) |*w| w.deinit(alloc);
+        if (self.model_wins.len > 0) alloc.free(self.model_wins);
+        self.model_wins = &.{};
+    }
+
+    fn freeModelWorkspaces(self: *Worker) void {
+        const alloc = self.st.alloc;
+        for (self.model_ws) |*ws| ws.deinit(alloc);
+        if (self.model_ws.len > 0) alloc.free(self.model_ws);
+        self.model_ws = &.{};
+    }
+
+    fn freeModelOutputs(self: *Worker) void {
+        const alloc = self.st.alloc;
+        for (self.model_outs) |*o| o.deinit(alloc);
+        if (self.model_outs.len > 0) alloc.free(self.model_outs);
+        self.model_outs = &.{};
+    }
 };
 
 fn closeStreamConn(st: *State) void {
@@ -656,12 +999,12 @@ fn streamReaderMain(st: *State) void {
 fn workerMain(st: *State) void {
     var w = Worker{ .st = st };
     defer w.deinit();
-    var dirty = false;
     while (!st.stop.load(.seq_cst)) {
         w.drainActions();
         const now = st.nowMs();
         w.tryConnect(now);
-        // Event stream: keep one reader; drain pushed events.
+        // Event stream: keep one reader; apply pushed events straight into
+        // the model — no follow-up query needed for the UI to update.
         if (st.reader == null and now >= st.next_stream_ms) {
             if (std.Thread.spawn(.{}, streamReaderMain, .{st})) |t| {
                 st.reader = t;
@@ -675,7 +1018,9 @@ fn workerMain(st: *State) void {
             if (st.streamQ.popAll(&sq)) {
                 for (sq.items) |*m| {
                     switch (m.*) {
-                        .event => dirty = true,
+                        .event => |*ev| {
+                            if (w.applyStreamEvent(ev)) w.publishModel();
+                        },
                         .disconnected => {
                             if (st.reader) |t| {
                                 t.join();
@@ -688,20 +1033,24 @@ fn workerMain(st: *State) void {
                 }
             }
         }
-        // Push-driven while the stream is up (coalesce bursts), with a slow
-        // safety re-sync; periodic polling only as fallback while down.
-        const interval: i64 = if (st.reader != null)
-            (if (dirty) stream_cooldown_ms else stream_resync_ms)
-        else
-            fetch_every_ms;
-        const want_fetch = dirty or st.reader == null or now - w.last_fetch_ms >= stream_resync_ms;
-        if (w.conn != null and want_fetch and now - w.last_fetch_ms >= interval) {
+        // Full fetch only as fallback while the stream is down, plus a slow
+        // safety re-sync while it is up.
+        const interval: i64 = if (st.reader != null) stream_resync_ms else fetch_every_ms;
+        if (w.conn != null and now - w.last_fetch_ms >= interval) {
             w.last_fetch_ms = now;
-            dirty = false;
-            st.inbox.push(w.fetchSnapshot());
+            var snap = w.fetchSnapshot();
+            if (snap.connected) {
+                // Adopted into the model (which publishes a clone and wakes
+                // the GUI); the reset snapshot owns nothing afterwards.
+                w.adoptSnapshot(&snap);
+            } else {
+                st.inbox.push(snap);
+                st.requestRefresh();
+            }
         } else if (w.conn == null and now - w.last_fetch_ms >= fetch_every_ms) {
             w.last_fetch_ms = now;
             st.inbox.push(.{ .connected = false });
+            st.requestRefresh();
         }
         st.io.sleep(.fromMilliseconds(loop_sleep_ms), .awake) catch {};
     }
