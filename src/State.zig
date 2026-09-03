@@ -125,14 +125,47 @@ fn cloneOutput(self: *State, o: proto.Output) !proto.Output {
     };
 }
 
+pub fn connectTo(self: *State, path: []const u8) void {
+    if (nilebank.Connection.initPath(self.alloc, self.io, path)) |c| {
+        self.conn = c;
+        self.connected = true;
+        self.status_text = "connected";
+    } else |_| {}
+}
+
+fn getEnv(key: []const u8) ?[]const u8 {
+    const env_path: [*:0]const u8 = "/proc/self/environ";
+    const fd_i = std.os.linux.openat(std.os.linux.AT.FDCWD, env_path, .{}, 0);
+    if (@as(isize, @bitCast(fd_i)) < 0) return null;
+    const fd: i32 = @intCast(fd_i);
+    defer _ = std.os.linux.close(fd);
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = std.os.linux.read(fd, &buf, buf.len - total);
+        if (@as(isize, @bitCast(n)) <= 0) break;
+        total += n;
+    }
+    var start: usize = 0;
+    while (start < total) {
+        var end = start;
+        while (end < total and buf[end] != 0) end += 1;
+        const entry = buf[start..end];
+        if (std.mem.startsWith(u8, entry, key) and entry.len > key.len and entry[key.len] == '=') {
+            return entry[key.len + 1 ..];
+        }
+        start = end + 1;
+    }
+    return null;
+}
+
 fn tryConnect(self: *State) void {
     if (self.conn != null) return;
     const now = self.nowMs();
     if (now < self.next_reconnect_ms) return;
 
     // Env override takes precedence – explicit path via NILE_SOCKET
-    if (std.c.getenv("NILE_SOCKET")) |cstr| {
-        const p = std.mem.span(cstr);
+    if (getEnv("NILE_SOCKET")) |p| {
         if (nilebank.Connection.initPath(self.alloc, self.io, p)) |c| {
             self.conn = c;
             self.connected = true;
