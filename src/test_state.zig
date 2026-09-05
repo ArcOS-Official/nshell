@@ -13,6 +13,10 @@ const Ctx = struct {
     switch_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     focus_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     capture_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    // Fail the first capture for window 102, succeed after: proves a
+    // transient error backs off and retries instead of disabling
+    // thumbnails forever.
+    cap102_calls: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 };
 
 fn fakeHandler(ctx: ?*anyopaque, msg: nilebank.Message) anyerror!nilebank.Message {
@@ -49,6 +53,10 @@ fn fakeHandler(ctx: ?*anyopaque, msg: nilebank.Message) anyerror!nilebank.Messag
             break :blk .{ .pong = .{ .nonce = v.id } };
         },
         .get_window => |v| blk: {
+            // Unknown id: window is gone; lets the client prune its stub.
+            if (v.id == 999) {
+                break :blk .{ .error_msg = .{ .code = 2, .message = try alloc.dupe(u8, "window not found") } };
+            }
             const wins = try alloc.alloc(proto.Window, 1);
             wins[0] = .{
                 .id = v.id,
@@ -61,6 +69,9 @@ fn fakeHandler(ctx: ?*anyopaque, msg: nilebank.Message) anyerror!nilebank.Messag
         },
         .capture_window => |v| blk: {
             _ = c.capture_count.fetchAdd(1, .seq_cst);
+            if (v.window_id == 102 and c.cap102_calls.fetchAdd(1, .seq_cst) == 0) {
+                break :blk .{ .error_msg = .{ .code = 3, .message = try alloc.dupe(u8, "busy") } };
+            }
             if (v.window_id == 101) {
                 const data = try alloc.dupe(u8, &[_]u8{ 0, 0, 255, 255 });
                 break :blk .{ .window_image = .{ .window_id = v.window_id, .image = .{
@@ -97,6 +108,10 @@ test "state: query, broadcast override, actions, images via 2-way connection" {
     state.socket_path_override = path;
     try state.init(alloc, io);
     const wt = try std.Thread.spawn(.{}, State.worker, .{ &state, io });
+    // Teardown via defer (deinit first, then join) so a failing assertion
+    // can't leak the worker into freed state and segfault the binary.
+    defer wt.join();
+    defer state.deinit();
 
     // Initial query populates the model.
     var tries: usize = 0;
@@ -124,7 +139,9 @@ test "state: query, broadcast override, actions, images via 2-way connection" {
     }
     try t.expectEqualStrings("hello", state.windows[0].title);
 
-    // Unknown window converges via get_window fill.
+    // Unknown window converges via get_window fill WITHOUT wiping the
+    // existing list (regression: fills used to replace the whole model,
+    // so the switcher showed only one window).
     {
         var ev: proto.Event = .{ .new_window = .{ .id = 101, .title = try alloc.dupe(u8, "fresh") } };
         defer ev.deinit(alloc);
@@ -148,7 +165,71 @@ test "state: query, broadcast override, actions, images via 2-way connection" {
             try t.expectEqualStrings("filled", w.title);
         }
         try t.expect(found);
+        // The pre-existing window must survive the fill.
+        try t.expectEqual(@as(usize, 2), state.windows.len);
+        try t.expectEqualStrings("hello", state.windows[0].title);
     }
+
+    // Focus order: a window_focused push moves the row to the front (MRU)
+    // so the switcher lists index 0 = currently focused.
+    {
+        var ev: proto.Event = .{ .window_focused = .{ .id = 101, .old_id = 100 } };
+        defer ev.deinit(alloc);
+        try server.broadcastCompositorEventDefault(ev);
+    }
+    tries = 0;
+    while (tries < 500) : (tries += 1) {
+        state.update();
+        if (state.windows.len == 2 and state.windows[0].id == 101) break;
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try t.expectEqual(@as(u64, 101), state.windows[0].id);
+    try t.expectEqual(@as(u64, 100), state.windows[1].id);
+    try t.expect(state.windows[0].focused);
+    try t.expect(!state.windows[1].focused);
+
+    // Full-list pushes (e.g. the server's MRU re-push on focus change)
+    // replace in the transmitted order.
+    {
+        const items = try alloc.alloc(proto.Window, 2);
+        items[0] = .{ .id = 100, .title = try alloc.dupe(u8, "hello"), .focused = true };
+        items[1] = .{ .id = 101, .title = try alloc.dupe(u8, "filled"), .focused = false };
+        var ev: proto.Event = .{ .windows = .{ .items = items } };
+        defer ev.deinit(alloc);
+        try server.broadcastCompositorEventDefault(ev);
+    }
+    tries = 0;
+    while (tries < 500) : (tries += 1) {
+        state.update();
+        if (state.windows.len == 2 and state.windows[0].id == 100 and state.windows[0].focused) break;
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try t.expectEqual(@as(u64, 100), state.windows[0].id);
+    try t.expectEqual(@as(u64, 101), state.windows[1].id);
+
+    // Gone window: a get_window error prunes the stub instead of leaving a
+    // blank switcher entry.
+    {
+        var ev: proto.Event = .{ .new_window = .{ .id = 999, .title = try alloc.dupe(u8, "ghost") } };
+        defer ev.deinit(alloc);
+        try server.broadcastCompositorEventDefault(ev);
+    }
+    var saw_ghost = false;
+    tries = 0;
+    while (tries < 1000) : (tries += 1) {
+        state.update();
+        var ghost = false;
+        for (state.windows) |*w| {
+            if (w.id == 999) ghost = true;
+        }
+        if (ghost) saw_ghost = true;
+        // Wait until the stub appears AND is then pruned by the error fill.
+        if (saw_ghost and !ghost) break;
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try t.expect(saw_ghost);
+    for (state.windows) |*w| try t.expect(w.id != 999);
+    try t.expectEqual(@as(usize, 2), state.windows.len);
 
     // Actions reach the server.
     state.switchWorkspace(42);
@@ -207,7 +288,40 @@ test "state: query, broadcast override, actions, images via 2-way connection" {
     try t.expect(img101 != null);
     try t.expectEqualSlices(u8, &[_]u8{255, 0, 0, 255}, img101.?.pixels.rgba);
 
-    state.deinit();
-    wt.join();
+    // Transient capture error backs off and retries: the first request for
+    // 102 fails with code 3, but the thumbnail must still arrive instead of
+    // being disabled forever.
+    _ = state.windowImage(102);
+    var img102: ?dvui.ImageSource = null;
+    tries = 0;
+    while (tries < 1500) : (tries += 1) {
+        state.update();
+        img102 = state.windowImage(102);
+        if (img102 != null) break;
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try t.expect(img102 != null);
+    try t.expectEqual(@as(u32, 2), img102.?.pixels.width);
+    try t.expect(ctx.cap102_calls.load(.seq_cst) >= 2);
+
+    // Prefetch coalescing: back-to-back prefetches issue no duplicate
+    // traffic. Drain the first prefetch, snapshot, then prefetch again —
+    // everything is freshly requested/fetched, so the second adds nothing.
+    // (Sleeps stay well under the 2s image TTL so refetch can't kick in.)
+    state.prefetchWindowImages();
+    var drain: usize = 0;
+    while (drain < 60) : (drain += 1) {
+        state.update();
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    const after_first_prefetch = ctx.capture_count.load(.seq_cst);
+    state.prefetchWindowImages();
+    var spins: usize = 0;
+    while (spins < 60) : (spins += 1) {
+        state.update();
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try t.expectEqual(after_first_prefetch, ctx.capture_count.load(.seq_cst));
+
     std.Io.Dir.deleteFileAbsolute(io, path) catch {};
 }

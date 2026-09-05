@@ -16,8 +16,14 @@ const socket_path = "/tmp/arcos/compositor.sock";
 // than this is served without compositor traffic, and re-requests for the
 // same id are coalesced to at most one per window.
 const image_ttl_ms: i64 = 2000;
-// Native resolution; the GPU scales thumbnails down at draw time.
-const image_capture_scale: u32 = 1000;
+// Thumbnail resolution (1000 = native). The switcher draws at most ~100px,
+// so a small scale keeps the reply far under the 64KiB transport frame
+// while staying sharp on HiDPI; the GPU scales down at draw time.
+const image_capture_scale: u32 = 200;
+// Pause after a capture error before trying again. Matches the freshness
+// window so a struggling server is retried about as often as a stale image
+// would refresh anyway — slow streams keep flowing instead of stalling.
+const image_error_backoff_ms: i64 = 2000;
 
 const reconnect_ms: i64 = 1500;
 const loop_sleep_ms: u64 = 25;
@@ -129,10 +135,13 @@ stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 worker_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-// Capture support probe. The server answers capture_* with error code 3
-// ("capture not implemented", see ../nile/nile/Bank.zig); while set,
-// windowImage() skips compositor traffic and serves cache-or-null.
-capture_unsupported: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+// Capture backoff (boot-ms timestamp; 0 = no backoff). The server may
+// answer capture_* with error code 3 when it can't serve a frame right now
+// ("capture not implemented" on old servers, or transient busy/not-ready on
+// slow ones streaming ~1fps). A single error must NOT permanently disable
+// thumbnails, so we only pause new capture traffic until this timestamp and
+// keep serving cache-or-null meanwhile. Cleared on the next success.
+capture_backoff_until_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
 
 // Test override for the socket path (live code always uses the canonical
 // ../nile paths above).
@@ -177,7 +186,7 @@ pub fn initWithWakeup(
     self.stop = std.atomic.Value(bool).init(false);
     self.worker_done = std.atomic.Value(bool).init(false);
     self.closed = std.atomic.Value(bool).init(false);
-    self.capture_unsupported = std.atomic.Value(bool).init(false);
+    self.capture_backoff_until_ms = std.atomic.Value(i64).init(0);
     self.wakeup_ctx = wakeup_ctx;
     self.wakeup_fn = wakeup_fn;
     self.inited.store(true, .seq_cst);
@@ -227,13 +236,17 @@ pub fn focusWindow(self: *State, id: u64) void {
 // Fetch-on-call: a miss enqueues an async capture and returns null (or stale
 // pixels while refreshing); the listener/worker wakes the GUI when pixels
 // land via the commit queue. Never blocks on IPC.
+fn captureBackedOff(self: *State, now: i64) bool {
+    return now < self.capture_backoff_until_ms.load(.seq_cst);
+}
+
 pub fn windowImage(self: *State, id: u64) ?dvui.ImageSource {
     const now = self.nowMs();
     if (self.images.getPtr(id)) |e| {
         if (e.fetched_ms != 0 and now - e.fetched_ms < image_ttl_ms) {
             return e.imageSource();
         }
-        if (self.capture_unsupported.load(.seq_cst)) {
+        if (self.captureBackedOff(now)) {
             if (e.fetched_ms == 0) return null;
             return e.imageSource();
         }
@@ -246,10 +259,30 @@ pub fn windowImage(self: *State, id: u64) ?dvui.ImageSource {
         if (e.fetched_ms == 0) return null;
         return e.imageSource();
     }
-    if (self.capture_unsupported.load(.seq_cst)) return null;
+    if (self.captureBackedOff(now)) return null;
     self.images.put(id, .{ .requested_ms = now }) catch return null;
     self.req_q.push(self.alloc, self.io, .{ .capture_window = .{ .id = id, .scale = image_capture_scale } });
     return null;
+}
+
+// UI thread only. Enqueue a capture for every listed window whose cached
+// image is missing or stale. Call when opening the switcher so thumbnails
+// converge in one round trip instead of one per frame. Never blocks on IPC;
+// windowImage() coalescing still caps traffic to one request per window.
+pub fn prefetchWindowImages(self: *State) void {
+    const now = self.nowMs();
+    if (self.captureBackedOff(now)) return;
+    for (self.windows) |*w| {
+        const e = self.images.getPtr(w.id);
+        if (e) |entry| {
+            if (entry.fetched_ms != 0 and now - entry.fetched_ms < image_ttl_ms) continue;
+            if (now - entry.requested_ms < image_ttl_ms) continue;
+            entry.requested_ms = now;
+        } else {
+            self.images.put(w.id, .{ .requested_ms = now }) catch continue;
+        }
+        self.req_q.push(self.alloc, self.io, .{ .capture_window = .{ .id = w.id, .scale = image_capture_scale } });
+    }
 }
 
 // UI thread only. Applies all queued broadcasts/captures to the model.
@@ -296,15 +329,28 @@ pub fn worker(self: *State, io: std.Io) void {
             io.sleep(.fromMilliseconds(loop_sleep_ms), .awake) catch return;
             continue;
         }
-        for (batch.items) |*a| {
-            self.handleAction(conn, a) catch {
+        var i: usize = 0;
+        var disconnected = false;
+        while (i < batch.items.len) : (i += 1) {
+            self.handleAction(conn, &batch.items[i]) catch {
                 // Disconnected mid-batch: drop the connection so the next
-                // tick reconnects; the remaining actions stay queued.
-                synced = false;
+                // tick reconnects. The batch was already popped, so re-queue
+                // the unprocessed tail (including the failed action) instead
+                // of dropping fills/captures on the floor.
+                disconnected = true;
                 break;
             };
-            a.deinit(self.alloc);
+            batch.items[i].deinit(self.alloc);
             if (self.stop.load(.seq_cst)) return;
+        }
+        if (disconnected) {
+            // Re-queue the unprocessed tail (Action is plain data, no heap,
+            // so copies are safe). The request queue is drained with popAll
+            // and replayed in order, so appending items[i..] preserves the
+            // original sequence.
+            for (batch.items[i..]) |a| self.req_q.push(self.alloc, self.io, a);
+            synced = false;
+            self.dropConn();
         }
     }
 }
@@ -322,6 +368,34 @@ fn onEvent(ctx: ?*anyopaque, msg: nilebank.Message) void {
     const ev = proto.Event.decodeAllocWith(self.alloc, msg.kind, msg.data, msg.encoding) catch return;
     self.commitEvent(ev);
     self.requestRefresh();
+}
+
+// Worker-only. Decompose one full window record (a get_window reply) into
+// owned incremental events so update() merges it into the existing row
+// instead of replacing the whole list. Every string is duped: the source
+// record is freed by the caller's `defer ev.deinit`.
+fn commitFill(self: *State, w: *const proto.Window) void {
+    if (w.title.len > 0) {
+        const owned = self.alloc.dupe(u8, w.title) catch null;
+        if (owned) |t| self.commitEvent(.{ .window_title_changed = .{ .id = w.id, .title = t } });
+    }
+    if (w.app_id.len > 0) {
+        const owned = self.alloc.dupe(u8, w.app_id) catch null;
+        if (owned) |a| self.commitEvent(.{ .window_app_id_changed = .{ .id = w.id, .app_id = a } });
+    }
+    self.commitEvent(.{ .window_state_changed = .{
+        .id = w.id,
+        .floating = w.floating,
+        .fullscreen = w.fullscreen,
+        .urgent = w.urgent,
+        .focused = w.focused,
+    } });
+    self.commitEvent(.{ .window_workspace_changed = .{
+        .id = w.id,
+        .old_workspace = 0,
+        .new_workspace = w.workspace,
+    } });
+    self.commitEvent(.{ .window_moved = .{ .id = w.id, .rect = w.rect } });
 }
 
 // Guarded commit-queue insert shared by the listener and the worker.
@@ -361,8 +435,8 @@ fn ensureConn(self: *State, io: std.Io, next_connect_ms: *i64) ?*nilebank.Connec
     self.conn_mu.lockUncancelable(self.io);
     self.conn = conn;
     self.conn_mu.unlock(self.io);
-    // A fresh server re-probes capture support; a late deinit closes us.
-    self.capture_unsupported.store(false, .seq_cst);
+    // A fresh server gets a fresh capture probe; a late deinit closes us.
+    self.capture_backoff_until_ms.store(0, .seq_cst);
     self.requestRefresh();
     if (self.stop.load(.seq_cst) or self.closed.load(.seq_cst)) {
         self.dropConn();
@@ -406,16 +480,30 @@ fn handleAction(self: *State, conn: *nilebank.Connection, a: *Action) !void {
             defer ev.deinit(self.alloc);
         },
         .get_window => |id| {
+            // A get_window reply is a single-record fill, NOT a full list:
+            // committing it as `.windows` would make applyEvent replace the
+            // whole model with one row (the "switcher shows only one window"
+            // bug). Decompose into incremental merges instead, so full-list
+            // `.windows` pushes remain the only path that replaces (and thus
+            // defines MRU focus order).
             var ev = try conn.requestCompositor(.{ .get_window = .{ .id = id } }, .raw);
-            if (ev == .windows) {
-                self.commitEvent(ev);
+            defer ev.deinit(self.alloc);
+            if (ev != .windows) {
+                // Unknown/gone window: prune a stale stub so it can't linger
+                // as a blank switcher entry. A live window re-appears via
+                // the next push + fill cycle.
+                self.commitEvent(.{ .window_closed = .{ .id = id } });
                 self.requestRefresh();
-            } else {
-                ev.deinit(self.alloc);
+                return;
             }
+            var filled = false;
+            for (ev.windows.items) |*w| {
+                self.commitFill(w);
+                filled = true;
+            }
+            if (filled) self.requestRefresh();
         },
         .capture_window => |c| {
-            if (self.capture_unsupported.load(.seq_cst)) return;
             var ev = try conn.requestCompositor(
                 .{ .capture_window = .{ .window_id = c.id, .scale = c.scale } },
                 .raw,
@@ -433,6 +521,9 @@ fn handleAction(self: *State, conn: *nilebank.Connection, a: *Action) !void {
                                 .format = .rgba8,
                                 .data = norm.rgba,
                             };
+                            // Success clears any earlier backoff: the server
+                            // is streaming, even if slowly.
+                            self.capture_backoff_until_ms.store(0, .seq_cst);
                             self.commitEvent(ev);
                             self.requestRefresh();
                             consumed = true;
@@ -441,9 +532,13 @@ fn handleAction(self: *State, conn: *nilebank.Connection, a: *Action) !void {
                 },
                 .error_msg => |e| {
                     if (e.code == 3) {
-                        if (!self.capture_unsupported.swap(true, .seq_cst)) {
-                            std.log.info("capture unsupported by compositor, thumbnails disabled", .{});
-                        }
+                        // Transient OR permanent ("not implemented"): either
+                        // way just pause and retry later. A slow server that
+                        // answers every now and then keeps flowing instead of
+                        // being latched off forever.
+                        const until = self.nowMs() + image_error_backoff_ms;
+                        self.capture_backoff_until_ms.store(until, .seq_cst);
+                        std.log.debug("capture error {d}, backing off {d}ms", .{ e.code, image_error_backoff_ms });
                     }
                 },
                 else => {},
@@ -621,22 +716,19 @@ fn upsertWorkspace(self: *State, ws: proto.Workspace) void {
     };
 }
 
-// Steal one full window record into the model (a get_window reply). The
-// caller must not use the source afterwards; its strings are neutralized so
-// the message deinit stays safe.
-fn adoptFillWindow(self: *State, f: *proto.Window) void {
-    for (self.windows) |*cur| {
-        if (cur.id != f.id) continue;
-        cur.deinit(self.alloc);
-        cur.* = f.*;
-        f.title = "";
-        f.app_id = "";
+// Move the row for `id` to index 0, preserving the relative order of the
+// rest. No-op when already first or unknown. Keeps the model in MRU focus
+// order on every focus signal, so the switcher stays sorted even if the
+// server's full-list `.windows` re-push is delayed or missed.
+fn moveWindowToFront(self: *State, id: u64) void {
+    for (self.windows, 0..) |*w, i| {
+        if (w.id != id) continue;
+        if (i == 0) return;
+        const tmp = self.windows[i];
+        std.mem.copyBackwards(proto.Window, self.windows[1 .. i + 1], self.windows[0..i]);
+        self.windows[0] = tmp;
         return;
     }
-    self.windows = self.alloc.realloc(self.windows, self.windows.len + 1) catch return;
-    self.windows[self.windows.len - 1] = f.*;
-    f.title = "";
-    f.app_id = "";
 }
 
 // Adopt a worker capture into the image map, stealing ownership of the
@@ -668,10 +760,13 @@ fn adoptImage(self: *State, id: u64, img: *proto.Image) void {
     img.data = "";
 }
 
-// Apply one queued broadcast to the model. Full-list pushes replace (they
-// are the server's current truth); incremental ones merge. Unknown ids get
-// a stub plus a get_window fill request so a missed new_window still
-// converges once the worker answers.
+// Apply one queued broadcast to the model. Full-list `.windows` pushes
+// replace (they are the server's current truth, already in MRU focus
+// order); incremental pushes merge without disturbing order, except focus
+// signals which move the focused row to the front. Unknown ids get a stub
+// plus a get_window fill request so a missed new_window still converges
+// once the worker answers (fills arrive decomposed as incremental merges,
+// never as list replacements).
 fn applyEvent(self: *State, ev: *proto.Event) void {
     switch (ev.*) {
         .windows_snapshot, .windows => {
@@ -708,6 +803,9 @@ fn applyEvent(self: *State, ev: *proto.Event) void {
         .window_closed => |v| self.removeWindow(v.id),
         .window_focused => |v| {
             for (self.windows) |*w| w.focused = (w.id == v.id);
+            // MRU first: the focused window heads the list so the switcher
+            // mirrors focus order without waiting for the server re-push.
+            if (v.id != 0) self.moveWindowToFront(v.id);
         },
         .window_title_changed => |v| {
             const created = self.ensureWindow(v.id);
@@ -730,6 +828,7 @@ fn applyEvent(self: *State, ev: *proto.Event) void {
             rec.fullscreen = v.fullscreen;
             rec.urgent = v.urgent;
             rec.focused = v.focused;
+            if (v.focused) self.moveWindowToFront(v.id);
             if (created) self.req_q.push(self.alloc, self.io, .{ .get_window = v.id });
         },
         .window_workspace_changed => |v| {

@@ -27,6 +27,11 @@ const Ui = struct {
     }
 
     pub fn switchMode(self: *Ui, mode: HubMode) void {
+        if (mode == .windows) {
+            // Warm every thumbnail in one round trip so the switcher fills
+            // together instead of one capture per frame.
+            state.prefetchWindowImages();
+        }
         self.hubmode = mode;
         setTarget(switch (mode) {
             .windows => .{ .w = 600, .h = 120 },
@@ -507,7 +512,20 @@ pub fn hubFrame() !dvui.App.Result {
             );
             defer list.deinit();
 
-            if (hub_target != null) return .ok;
+            // state.windows is already in MRU focus order (State keeps it
+            // sorted on every focus signal + full-list push), so render in
+            // order: index 0 is the currently focused window.
+            if (selected >= state.windows.len) selected = 0;
+            if (state.windows.len == 0) {
+                dvui.labelNoFmt(@src(), "No windows", .{
+                    .align_x = 0.5,
+                    .align_y = 0.5,
+                }, .{
+                    .font = t.font_title,
+                    .expand = .both,
+                });
+                return .ok;
+            }
             for (state.windows, 0..) |w, i| {
                 const c = if (i == selected)
                     base.lighten(10)
