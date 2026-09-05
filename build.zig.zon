@@ -13,8 +13,7 @@
             .hash = "dvui-0.5.0-dev-AQFJmWfx-wBObpJ1cR37uegD8XexNPqnhOI41jPAOYcY",
         },
         .nilebank = .{
-            .url = "git+https://github.com/ArcOS-Official/nilebank#f9aa29d989a2e63b784e42d781a354d06f785b5d",
-            .hash = "nilebank-0.0.0-xHtKtG-yAQCHXuqUNkS8AbKwFcaDNMt45Xsbyi4Pqra6",
+            .path = "../nilebank",
         },
         .dvui_layer_shell = .{
             .url = "git+https://github.com/ArcOS-Official/dvui_layershell.git#e7786b4959d1ab8076a0c6c35830a1e19e6a362f",

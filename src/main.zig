@@ -8,6 +8,9 @@ pub const std_options: std.Options = .{ .logFn = dvui.App.logFn };
 
 const Ui = struct {
     hubmode: HubMode = .clock,
+    last_hubmode: HubMode = .clock,
+    anim_id: dvui.Id = undefined,
+    hub_was_hovered: bool = false,
 
     pub const HubMode = enum {
         clock,
@@ -16,6 +19,21 @@ const Ui = struct {
         launcher,
         search,
     };
+
+    pub fn init() Ui {
+        return .{
+            .anim_id = .extendId(null, @src(), 0),
+        };
+    }
+
+    pub fn switchMode(self: *Ui, mode: HubMode) void {
+        self.hubmode = mode;
+        setTarget(switch (mode) {
+            .windows => .{ .w = 600, .h = 120 },
+            .clock => .{ .w = 150, .h = 50 },
+            else => .{ .w = 480, .h = 180 },
+        });
+    }
 };
 
 var state: State = undefined;
@@ -51,10 +69,10 @@ fn pumpEvents(backend_bar: anytype, win_bar: anytype, backend_hub: anytype, win_
             _ = try backend_hub.addEvent(win_hub, ev);
             continue;
         }
-        const target = C.SDL_GetWindowFromEvent(&ev);
-        if (target == null or target == backend_bar.window) {
+        const t_ = C.SDL_GetWindowFromEvent(&ev);
+        if (t_ == null or t_ == backend_bar.window) {
             _ = try backend_bar.addEvent(win_bar, ev);
-        } else if (target == backend_hub.window) {
+        } else if (t_ == backend_hub.window) {
             _ = try backend_hub.addEvent(win_hub, ev);
         } else {
             _ = try backend_bar.addEvent(win_bar, ev);
@@ -62,7 +80,10 @@ fn pumpEvents(backend_bar: anytype, win_bar: anytype, backend_hub: anytype, win_
     }
 }
 
+const LayerShellWindow = @typeInfo(@TypeOf(ls.initWindow)).@"fn".return_type.?;
+
 var win_hub_g: *dvui.Window = undefined;
+var ctx_hub_g: *ls.WaylandContextType = undefined;
 
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
@@ -105,6 +126,7 @@ pub fn main(init: std.process.Init) !u8 {
         .anchors = .{ .top, null, null, null },
         .padding = .{ 4, 0, 0, 0 },
     }, gpa);
+    ctx_hub_g = ctx_hub.waylandCtx;
     var backend_hub = ctx_hub.backend;
     // Only the bar backend quits SDL; the hub only destroys its own
     // window/renderer (same convention as secondary os windows).
@@ -134,11 +156,17 @@ pub fn main(init: std.process.Init) !u8 {
     win_hub_g = &win_hub;
     win_hub.open_flag = &hub_open;
     defer win_hub.deinit();
+    ui = .init();
 
-    try state.initWithWakeup(&win_bar, &requestDvuiRefresh);
+    try state.initWithWakeup(gpa, io, &win_bar, &requestDvuiRefresh);
     defer state.deinit();
 
-    var ref = io.async(struct{
+    // Worker after init (it spins until `inited`), cancelled before deinit
+    // frees the model: LIFO defers run cancel first.
+    var a = io.async(State.worker, .{ &state, io });
+    defer a.cancel(io);
+
+    var ref = io.async(struct {
         pub fn refresh(io_: std.Io) void {
             while (true) {
                 io_.sleep(.fromSeconds(1), .awake) catch {
@@ -193,7 +221,7 @@ fn truncateTitle(s: []const u8, max: usize) []const u8 {
 }
 
 fn frame() !dvui.App.Result {
-    state.poll();
+    state.update();
 
     var t = &dvui.currentWindow().theme;
 
@@ -283,22 +311,125 @@ fn frame() !dvui.App.Result {
     return .ok;
 }
 
+// Hub resize state. `hub_cur` animates `hub_from -> hub_target` and drives
+// the content box; the layer-shell surface jumps exactly once per
+// transition: pre-grow (room first, so growing content never clips) or
+// post-shrink (content shrinks first, so the window never snaps smaller
+// underneath it). Animation id is `ui.anim_id` (stable), not a widget id.
+var hub_from: dvui.Size = .{ .w = 150, .h = 50 };
+var hub_target: ?dvui.Size = null;
+var hub_cur: dvui.Size = .{ .w = 150, .h = 50 };
+var hub_surfaced: dvui.Size = .{ .w = 150, .h = 50 };
+var selected: usize = 0;
+
+fn setTarget(t: dvui.Size) void {
+    // No-op if already there / already heading there (kills click-spam
+    // restarts and mid-animation no-ops).
+    if (hub_target) |ta| {
+        if (ta.w == t.w and ta.h == t.h) return;
+    } else if (hub_cur.w == t.w and hub_cur.h == t.h) {
+        return;
+    }
+    hub_target = t;
+    hub_from = hub_cur;
+    dvui.animation(ui.anim_id, "hubsize", .{
+        .easing = dvui.easing.outQuart,
+        .end_time = 400_000, // micros; dvui.Animation runs on microsecond time
+    });
+}
+
+// Push a surface resize once; logical units (the backend forwards to both
+// the layer surface and SDL, so no manual content-scale multiply here).
+fn pushHubSurface(t: dvui.Size) void {
+    if (hub_surfaced.w == t.w and hub_surfaced.h == t.h) return;
+    hub_surfaced = t;
+    ctx_hub_g.setSize(
+        @as(u32, @intFromFloat(@round(t.w))),
+        @as(u32, @intFromFloat(@round(t.h))),
+    );
+}
+
 pub fn hubFrame() !dvui.App.Result {
     var t = &dvui.currentWindow().theme;
+    const base = t.color(.content, .fill);
+
+    // Advance the animated content size. Snaps on done/expiry so float
+    // rounding can never stall one step away from the target.
+    const hub_anim = dvui.animationGet(ui.anim_id, "hubsize");
+    if (hub_target) |ta| {
+        if (hub_anim) |a| {
+            hub_cur.w = std.math.lerp(hub_from.w, ta.w, a.value());
+            hub_cur.h = std.math.lerp(hub_from.h, ta.h, a.value());
+            if (a.done()) hub_cur = ta;
+        } else {
+            hub_cur = ta;
+        }
+    }
+
+    // Sync the surface once per transition.
+    if (hub_target) |ta| {
+        const expanding = ta.w > hub_from.w or ta.h > hub_from.h;
+        const done = hub_anim == null or hub_anim.?.done();
+        if (expanding) {
+            pushHubSurface(ta); // pre-resize
+            if (done) {
+                hub_target = null;
+                hub_from = ta;
+            }
+        } else if (done) {
+            hub_cur = ta;
+            pushHubSurface(ta); // post-resize
+            hub_target = null;
+            hub_from = ta;
+        }
+    }
+
     const outer = dvui.box(@src(), .{ .dir = .vertical }, .{
-        .expand = .both,
+        .min_size_content = hub_cur,
         .background = true,
-        .color_fill = t.color(.content, .fill),
+        .color_fill = base,
         .color_border = t.color(.content, .text).opacity(0.15),
         .border = .all(1),
         .corners = .all(10),
         .padding = .fromSize(.{ .w = 4 }),
         .gravity_y = 0.0,
+        .gravity_x = 0.5,
     });
     defer outer.deinit();
 
     switch (ui.hubmode) {
         .clock => {
+            var hover = false;
+            defer ui.hub_was_hovered = hover;
+            const clicked = dvui.clicked(outer.data(), .{
+                .hovered = &hover,
+                .hover_cursor = .arrow,
+            });
+            if (hover and !ui.hub_was_hovered) {
+                dvui.animation(outer.data().id, "hover", .{
+                    .easing = dvui.easing.outExpo,
+                    .end_time = @floor(std.time.us_per_s * 0.2),
+                });
+            }
+            if (!hover and ui.hub_was_hovered) {
+                dvui.animation(outer.data().id, "hover", .{
+                    .easing = dvui.easing.outExpo,
+                    .end_time = @floor(std.time.us_per_s * 0.2),
+                    .start_val = 1.0,
+                    .end_val = 0.0,
+                });
+            }
+
+            if (dvui.animationGet(outer.data().id, "hover")) |a| {
+                outer.data().options.color_fill = base.lighten(10 * a.value());
+                outer.data().options.color_border = .transparent;
+                outer.drawBackground();
+            } else if (hover) {
+                outer.data().options.color_fill = base.lighten(10);
+                outer.data().options.color_border = .transparent;
+                outer.drawBackground();
+            }
+
             const ts = std.Io.Clock.real.now(state.io);
             const s = ts.toSeconds();
             const stamp = std.time.epoch.EpochSeconds{ .secs = @intCast(s) };
@@ -318,6 +449,7 @@ pub fn hubFrame() !dvui.App.Result {
                 .{
                     .expand = .both,
                     .font = t.font_mono.withWeight(.bold).withSize(12.0),
+                    .color_text = t.color(.highlight, .fill).lighten(5),
                     .padding = .{ .y = 6 },
                 },
             );
@@ -361,6 +493,80 @@ pub fn hubFrame() !dvui.App.Result {
                     .padding = .{ .h = 6 },
                 },
             );
+            if (clicked)
+                ui.switchMode(.windows);
+        },
+        .windows => {
+            const list = dvui.flexbox(
+                @src(),
+                .{ .justify_content = .center },
+                .{
+                    .background = false,
+                    .expand = .both,
+                },
+            );
+            defer list.deinit();
+
+            if (hub_target != null) return .ok;
+            for (state.windows, 0..) |w, i| {
+                const c = if (i == selected)
+                    base.lighten(10)
+                else if (w.focused)
+                    t.color(.highlight, .fill).lighten(-15)
+                else
+                    base;
+                var btn: dvui.ButtonWidget = undefined;
+                btn.init(@src(), .{}, .{
+                    .color_fill = c,
+                    .expand = .ratio,
+                    .max_size_content = .{ .w = 100, .h = 100 },
+                    .min_size_content = .{ .w = 60, .h = 60 },
+                    .id_extra = i,
+                });
+                btn.processEvents();
+                defer btn.deinit();
+                if (btn.hovered()) {
+                    selected = i;
+                }
+                if (btn.clicked()) {
+                    state.focusWindow(w.id);
+                    ui.switchMode(ui.last_hubmode);
+                }
+                var box = dvui.box(
+                    @src(),
+                    .{ .dir = .vertical, .equal_space = true },
+                    .{
+                        .background = false,
+                        .expand = .both,
+                    },
+                );
+                defer box.deinit();
+                // Thumbnail once the async capture lands; the generic icon
+                // while it is still loading (windowImage returns null).
+                if (state.windowImage(w.id)) |src| {
+                    _ = dvui.image(@src(), .{
+                        .shrink = .ratio,
+                        .source = src,
+                    }, .{
+                        .expand = .both,
+                        .padding = .{ .y = 10 },
+                        .gravity_x = 0.5,
+                    });
+                } else {
+                    _ = dvui.icon(@src(), "window", dvui.entypo.image, .{}, .{
+                        .expand = .both,
+                        .padding = .{ .y = 10 },
+                        .gravity_x = 0.5,
+                    });
+                }
+                dvui.labelNoFmt(@src(), w.title, .{
+                    .align_x = 0.5,
+                    .align_y = 0.5,
+                }, .{
+                    .font = t.font_title,
+                    .expand = .horizontal,
+                });
+            }
         },
         else => {},
     }

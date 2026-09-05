@@ -57,13 +57,22 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_exe_tests.step);
 
-    // Separate test module for State.zig (no GUI deps)
+    // Separate test module for State.zig. State returns real dvui types,
+    // but the headless tests resolve `@import("dvui")` to a link-light shim
+    // (see src/dvui_shim.zig): the real backend module pulls SDL3/C objects
+    // into the link, which this toolchain cannot link.
+    const dvui_shim = b.createModule(.{
+        .root_source_file = b.path("src/dvui_shim.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const state_test_module = b.createModule(.{
         .root_source_file = b.path("src/test_state.zig"),
         .target = target,
         .optimize = optimize,
     });
     state_test_module.addImport("nilebank", nilebank_dep.module("nilebank"));
+    state_test_module.addImport("dvui", dvui_shim);
 
     const state_tests = b.addTest(.{
         .root_module = state_test_module,
