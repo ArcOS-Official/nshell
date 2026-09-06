@@ -11,6 +11,9 @@ const Ui = struct {
     last_hubmode: HubMode = .clock,
     anim_id: dvui.Id = undefined,
     hub_was_hovered: bool = false,
+    // Set when the switcher opens; hubFrame hands keyboard focus to the
+    // selected button once so Tab/Enter work without a first Tab press.
+    windows_need_focus: bool = false,
 
     pub const HubMode = enum {
         clock,
@@ -28,9 +31,18 @@ const Ui = struct {
 
     pub fn switchMode(self: *Ui, mode: HubMode) void {
         if (mode == .windows) {
+            if (state.windows.len == 0)
+                return;
             // Warm every thumbnail in one round trip so the switcher fills
             // together instead of one capture per frame.
             state.prefetchWindowImages();
+            if (self.hubmode != .windows) {
+                // Fresh open: start at the MRU head (index 0 is the focused
+                // window; State keeps the list in MRU order) and hand it
+                // keyboard focus so Tab/Enter work immediately.
+                selected = 0;
+                self.windows_need_focus = true;
+            }
         }
         self.hubmode = mode;
         setTarget(switch (mode) {
@@ -73,6 +85,14 @@ fn pumpEvents(backend_bar: anytype, win_bar: anytype, backend_hub: anytype, win_
             _ = try backend_bar.addEvent(win_bar, ev);
             _ = try backend_hub.addEvent(win_hub, ev);
             continue;
+        }
+        // dvui's SDL backend consumes FOCUS_GAINED/LOST for accesskit only
+        // and never surfaces them as dvui events, so track the hub's OS
+        // keyboard (input) focus ourselves for the switcher dismiss check.
+        if (ev.type == C.SDL_EVENT_WINDOW_FOCUS_GAINED or ev.type == C.SDL_EVENT_WINDOW_FOCUS_LOST) {
+            if (C.SDL_GetWindowFromEvent(&ev) == backend_hub.window) {
+                hub_keyboard_focused = ev.type == C.SDL_EVENT_WINDOW_FOCUS_GAINED;
+            }
         }
         const t_ = C.SDL_GetWindowFromEvent(&ev);
         if (t_ == null or t_ == backend_bar.window) {
@@ -126,7 +146,7 @@ pub fn main(init: std.process.Init) !u8 {
         .vsync = true,
     }, .{
         .layer = .overlay,
-        .namespace = "nshell-hub",
+        .namespace = State.shell_namespace,
         .center = .horizontal,
         .anchors = .{ .top, null, null, null },
         .padding = .{ 4, 0, 0, 0 },
@@ -326,6 +346,14 @@ var hub_target: ?dvui.Size = null;
 var hub_cur: dvui.Size = .{ .w = 150, .h = 50 };
 var hub_surfaced: dvui.Size = .{ .w = 150, .h = 50 };
 var selected: usize = 0;
+// Whether the hub layer surface currently holds OS keyboard (input)
+// focus. Updated in pumpEvents from raw SDL focus events. Defaults to
+// true so the switcher doesn't instantly dismiss before the first focus
+// event arrives (e.g. on compositors that never focus the overlay).
+var hub_keyboard_focused: bool = true;
+// Previous frame's state.launcher_open: hubFrame edge-detects on the
+// compositor's launcher pushes to open/activate the switcher.
+var launcher_was_open: bool = false;
 
 fn setTarget(t: dvui.Size) void {
     // No-op if already there / already heading there (kills click-spam
@@ -401,6 +429,33 @@ pub fn hubFrame() !dvui.App.Result {
         .gravity_x = 0.5,
     });
     defer outer.deinit();
+
+    if (state.launcher_open and ui.hubmode != .windows) {
+        // Compositor MOD press (../nile focuses this surface and pushes
+        // launcher_opened): open the switcher. nshell never learns which
+        // key MOD is — this level is the only MOD-derived signal consumed.
+        ui.switchMode(.windows);
+    } else if (!state.launcher_open and launcher_was_open and ui.hubmode == .windows) {
+        // Compositor MOD release: activate the selection, then dismiss.
+        // Runs before the focus-loss dismiss below so the selection isn't
+        // lost when focus snaps back to the window in the same iteration.
+        if (selected < state.windows.len) state.focusWindow(state.windows[selected].id);
+        ui.switchMode(ui.last_hubmode);
+    }
+    launcher_was_open = state.launcher_open;
+
+    // Local Tab-to-open, matched by keycode with modifiers ignored (there
+    // is no "tab" dvui bind, so matchBind can never fire for it): covers
+    // testing without a compositor and any focused-hub Tab press. With MOD
+    // held this still fires, so MOD+Tab opens without any MOD knowledge.
+    // In-switcher Tab cycling needs nothing here — dvui moves widget focus
+    // on Tab/Shift+Tab via next_widget/prev_widget, which ignore MOD.
+    for (dvui.events()) |ev| {
+        if (ev.evt == .key and ev.evt.key.code == .tab and ev.evt.key.action == .down) {
+            if (ui.hubmode != .windows) ui.switchMode(.windows);
+            break;
+        }
+    }
 
     switch (ui.hubmode) {
         .clock => {
@@ -512,25 +567,31 @@ pub fn hubFrame() !dvui.App.Result {
             );
             defer list.deinit();
 
-            // state.windows is already in MRU focus order (State keeps it
-            // sorted on every focus signal + full-list push), so render in
-            // order: index 0 is the currently focused window.
-            if (selected >= state.windows.len) selected = 0;
-            if (state.windows.len == 0) {
-                dvui.labelNoFmt(@src(), "No windows", .{
-                    .align_x = 0.5,
-                    .align_y = 0.5,
-                }, .{
-                    .font = t.font_title,
-                    .expand = .both,
-                });
-                return .ok;
+            // Dismiss the switcher when the hub surface loses OS keyboard
+            // (input) focus to another surface.
+            if (!hub_keyboard_focused) {
+                state.focusWindow(state.windows[selected].id);
+                ui.switchMode(ui.last_hubmode);
             }
+            // Esc dismisses without activating.
+            for (dvui.events()) |ev| {
+                if (ev.evt == .key and ev.evt.key.code == .escape and ev.evt.key.action == .down) {
+                    ui.switchMode(ui.last_hubmode);
+                    break;
+                }
+            }
+            if (selected >= state.windows.len) selected = 0;
+            // Keyboard focus drives the selection; mouse hover is the
+            // fallback for mouse-only use. dvui moves widget focus on
+            // Tab/Shift+Tab via its built-in next_widget/prev_widget binds,
+            // so no manual tab handling is needed here.
+            var focused_idx: ?usize = null;
+            var hovered_idx: ?usize = null;
             for (state.windows, 0..) |w, i| {
                 const c = if (i == selected)
-                    base.lighten(10)
+                    base.lighten(10.0)
                 else if (w.focused)
-                    t.color(.highlight, .fill).lighten(-15)
+                    t.color(.highlight, .fill).lighten(-15.0)
                 else
                     base;
                 var btn: dvui.ButtonWidget = undefined;
@@ -542,9 +603,17 @@ pub fn hubFrame() !dvui.App.Result {
                     .id_extra = i,
                 });
                 btn.processEvents();
+                btn.drawBackground();
                 defer btn.deinit();
+                if (btn.focused()) {
+                    focused_idx = i;
+                }
                 if (btn.hovered()) {
-                    selected = i;
+                    hovered_idx = i;
+                }
+                if (ui.windows_need_focus and i == selected) {
+                    dvui.focusWidget(btn.data().id, null, null);
+                    focused_idx = i;
                 }
                 if (btn.clicked()) {
                     state.focusWindow(w.id);
@@ -584,6 +653,12 @@ pub fn hubFrame() !dvui.App.Result {
                     .font = t.font_title,
                     .expand = .horizontal,
                 });
+            }
+            ui.windows_need_focus = false;
+            if (focused_idx) |f| {
+                selected = f;
+            } else if (hovered_idx) |h| {
+                selected = h;
             }
         },
         else => {},

@@ -13,6 +13,8 @@ const Ctx = struct {
     switch_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     focus_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     capture_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    // Set when the worker declares the hub namespace after (re)connect.
+    shell_registered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     // Fail the first capture for window 102, succeed after: proves a
     // transient error backs off and retries instead of disabling
     // thumbnails forever.
@@ -48,6 +50,11 @@ fn fakeHandler(ctx: ?*anyopaque, msg: nilebank.Message) anyerror!nilebank.Messag
             c.switch_id.store(v.id, .seq_cst);
             break :blk .{ .pong = .{ .nonce = v.id } };
         },
+        .shell_register => |v| blk: {
+            if (std.mem.eql(u8, v.namespace, State.shell_namespace))
+                c.shell_registered.store(true, .seq_cst);
+            break :blk .{ .pong = .{ .nonce = 0 } };
+        },
         .focus_window => |v| blk: {
             c.focus_id.store(v.id, .seq_cst);
             break :blk .{ .pong = .{ .nonce = v.id } };
@@ -75,14 +82,22 @@ fn fakeHandler(ctx: ?*anyopaque, msg: nilebank.Message) anyerror!nilebank.Messag
             if (v.window_id == 101) {
                 const data = try alloc.dupe(u8, &[_]u8{ 0, 0, 255, 255 });
                 break :blk .{ .window_image = .{ .window_id = v.window_id, .image = .{
-                    .width = 1, .height = 1, .stride = 4, .format = .bgra8, .data = data,
+                    .width = 1,
+                    .height = 1,
+                    .stride = 4,
+                    .format = .bgra8,
+                    .data = data,
                 } } };
             }
             const data = try alloc.alloc(u8, 12);
             @memcpy(data[0..8], &[_]u8{ 255, 0, 0, 255, 0, 255, 0, 255 });
             @memset(data[8..], 0);
             break :blk .{ .window_image = .{ .window_id = v.window_id, .image = .{
-                .width = 2, .height = 1, .stride = 12, .format = .rgba8, .data = data,
+                .width = 2,
+                .height = 1,
+                .stride = 12,
+                .format = .rgba8,
+                .data = data,
             } } };
         },
         else => .{ .error_msg = .{ .code = 1, .message = try alloc.dupe(u8, "unsupported") } },
@@ -124,6 +139,39 @@ test "state: query, broadcast override, actions, images via 2-way connection" {
     try t.expectEqual(@as(usize, 1), state.windows.len);
     try t.expectEqualStrings("main", state.workspaces[0].name);
     try t.expectEqualStrings("main.zig - nvim", state.windows[0].title);
+
+    // Shell registration: the worker declares the hub namespace on
+    // (re)connect so the compositor can focus it on MOD press.
+    tries = 0;
+    while (!ctx.shell_registered.load(.seq_cst) and tries < 500) : (tries += 1) {
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try t.expect(ctx.shell_registered.load(.seq_cst));
+
+    // Launcher pushes (compositor MOD press/release) flip the switcher
+    // flag hubFrame edge-detects on.
+    {
+        var ev: proto.Event = .{ .launcher_opened = {} };
+        defer ev.deinit(alloc);
+        try server.broadcastCompositorEventDefault(ev);
+    }
+    tries = 0;
+    while (!state.launcher_open and tries < 500) : (tries += 1) {
+        state.update();
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try t.expect(state.launcher_open);
+    {
+        var ev: proto.Event = .{ .launcher_closed = {} };
+        defer ev.deinit(alloc);
+        try server.broadcastCompositorEventDefault(ev);
+    }
+    tries = 0;
+    while (state.launcher_open and tries < 500) : (tries += 1) {
+        state.update();
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try t.expect(!state.launcher_open);
 
     // Broadcast overrides current state without any new request.
     {
@@ -286,7 +334,7 @@ test "state: query, broadcast override, actions, images via 2-way connection" {
         io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
     try t.expect(img101 != null);
-    try t.expectEqualSlices(u8, &[_]u8{255, 0, 0, 255}, img101.?.pixels.rgba);
+    try t.expectEqualSlices(u8, &[_]u8{ 255, 0, 0, 255 }, img101.?.pixels.rgba);
 
     // Transient capture error backs off and retries: the first request for
     // 102 fails with code 3, but the thumbnail must still arrive instead of

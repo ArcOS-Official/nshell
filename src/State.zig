@@ -5,6 +5,11 @@ const proto = nilebank.protocols.compositor;
 
 const State = @This();
 
+// Namespace of the interactive hub layer surface (see main.zig initWindow).
+// Declared to the compositor via shell_register so it can focus this
+// surface on MOD press without nshell ever learning which key MOD is.
+pub const shell_namespace = "nshell-hub";
+
 // Request/response socket served by ../nile (`Bank.socket_id = "compositor"`).
 // The same connection doubles as the push channel: the server broadcasts
 // unsolicited events (`Header.push_id`) over it, and nilebank's reader fiber
@@ -112,6 +117,12 @@ io: std.Io = undefined,
 workspaces: []proto.Workspace = &.{},
 windows: []proto.Window = &.{},
 
+// Compositor-driven switcher state. Set by launcher_opened/launcher_closed
+// pushes (MOD press/release in ../nile); hubFrame edge-detects on this to
+// open the switcher and activate the selection. Plain bool: only touched
+// by the UI thread in update(), read by frame code.
+launcher_open: bool = false,
+
 // UI-thread thumbnail cache (see ImageEntry).
 images: ImageMap = undefined,
 
@@ -177,6 +188,7 @@ pub fn initWithWakeup(
     self.io = io;
     self.workspaces = &.{};
     self.windows = &.{};
+    self.launcher_open = false;
     self.images = ImageMap.init(alloc);
     self.req_q = .{};
     self.commit_q = .{};
@@ -455,7 +467,15 @@ fn dropConn(self: *State) void {
 
 // Worker-only. Initial state after every (re)connect: the server answers
 // with full lists, which update() adopts. Later broadcasts override them.
+// shell_register runs first (re-registration after every reconnect, since
+// the compositor forgets it on restart): it tells ../nile which layer
+// surface to focus on MOD press, and acks with pong (dropped here).
 fn initialQuery(self: *State, conn: *nilebank.Connection) void {
+    if (conn.requestCompositor(.{ .shell_register = .{ .namespace = shell_namespace } }, .raw)) |*ev| {
+        ev.deinit(self.alloc);
+    } else |_| {
+        return;
+    }
     const queries = [_]proto.Request{
         .{ .list_windows = {} },
         .{ .list_workspaces = {} },
@@ -575,7 +595,7 @@ fn normalizeWindowImage(alloc: std.mem.Allocator, src: proto.Image) !struct {
 
     for (0..h) |y| {
         const srow = src.data[y * stride ..][0..row_bytes];
-        const drow = out[y * @as(usize, w) * 4 ..][0..@as(usize, w) * 4];
+        const drow = out[y * @as(usize, w) * 4 ..][0 .. @as(usize, w) * 4];
         switch (src.format) {
             .rgba8 => @memcpy(drow, srow),
             .bgra8 => {
@@ -858,6 +878,12 @@ fn applyEvent(self: *State, ev: *proto.Event) void {
         .switch_workspace => |v| {
             for (self.workspaces) |*ws| ws.current = (ws.number == v.index);
         },
+        // Compositor MOD-tap gesture (see ../nile Seat.shellModTap):
+        // launcher_opened on MOD press, launcher_closed on release.
+        // Flips the level hubFrame edge-detects to open/activate the
+        // switcher — the only MOD-derived signal nshell consumes.
+        .launcher_opened => self.launcher_open = true,
+        .launcher_closed => self.launcher_open = false,
         else => {},
     }
 }
