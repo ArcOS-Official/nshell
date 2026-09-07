@@ -367,7 +367,7 @@ fn setTarget(t: dvui.Size) void {
     hub_from = hub_cur;
     dvui.animation(ui.anim_id, "hubsize", .{
         .easing = dvui.easing.outQuart,
-        .end_time = 400_000, // micros; dvui.Animation runs on microsecond time
+        .end_time = 0.4 * std.time.us_per_s, // micros; dvui.Animation runs on microsecond time
     });
 }
 
@@ -419,6 +419,7 @@ pub fn hubFrame() !dvui.App.Result {
 
     const outer = dvui.box(@src(), .{ .dir = .vertical }, .{
         .min_size_content = hub_cur,
+        .max_size_content = .size(hub_cur),
         .background = true,
         .color_fill = base,
         .color_border = t.color(.content, .text).opacity(0.15),
@@ -430,11 +431,11 @@ pub fn hubFrame() !dvui.App.Result {
     });
     defer outer.deinit();
 
-    if (state.launcher_open and ui.hubmode != .windows) {
-        // Compositor MOD press (../nile focuses this surface and pushes
+    if (state.launcher_open and ui.hubmode != .launcher) {
+        // Compositor MOD press (nile focuses this surface and pushes
         // launcher_opened): open the switcher. nshell never learns which
         // key MOD is — this level is the only MOD-derived signal consumed.
-        ui.switchMode(.windows);
+        ui.switchMode(.launcher);
     } else if (!state.launcher_open and launcher_was_open and ui.hubmode == .windows) {
         // Compositor MOD release: activate the selection, then dismiss.
         // Runs before the focus-loss dismiss below so the selection isn't
@@ -452,7 +453,10 @@ pub fn hubFrame() !dvui.App.Result {
     // on Tab/Shift+Tab via next_widget/prev_widget, which ignore MOD.
     for (dvui.events()) |ev| {
         if (ev.evt == .key and ev.evt.key.code == .tab and ev.evt.key.action == .down) {
-            if (ui.hubmode != .windows) ui.switchMode(.windows);
+            if (ui.hubmode != .windows) {
+                ui.switchMode(.windows);
+                selected += 1;
+            }
             break;
         }
     }
@@ -661,7 +665,7 @@ pub fn hubFrame() !dvui.App.Result {
                 selected = h;
             }
         },
-        else => {},
+        else => ui.switchMode(.clock),
     }
 
     return .ok;
