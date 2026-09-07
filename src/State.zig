@@ -2,6 +2,7 @@ const std = @import("std");
 const dvui = @import("dvui");
 const nilebank = @import("nilebank");
 const proto = nilebank.protocols.compositor;
+const Launcher = @import("Launcher.zig");
 
 const State = @This();
 
@@ -146,6 +147,8 @@ stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 worker_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+launcher: Launcher = .{},
+
 // Capture backoff (boot-ms timestamp; 0 = no backoff). The server may
 // answer capture_* with error code 3 when it can't serve a frame right now
 // ("capture not implemented" on old servers, or transient busy/not-ready on
@@ -201,6 +204,7 @@ pub fn initWithWakeup(
     self.capture_backoff_until_ms = std.atomic.Value(i64).init(0);
     self.wakeup_ctx = wakeup_ctx;
     self.wakeup_fn = wakeup_fn;
+    self.launcher.init(alloc, io);
     self.inited.store(true, .seq_cst);
 }
 
@@ -230,6 +234,7 @@ pub fn deinit(self: *State) void {
     self.commit_q.mu.lockUncancelable(self.io);
     defer self.commit_q.mu.unlock(self.io);
     self.commit_q.deinit(self.alloc);
+    self.launcher.deinit();
 }
 
 // UI -> worker: just enqueue; the worker sends on its own connection.
@@ -326,6 +331,21 @@ pub fn worker(self: *State, io: std.Io) void {
     var synced = false;
     var next_connect_ms: i64 = 0;
     while (!self.stop.load(.seq_cst)) {
+        // Launcher search: drain pending queue concurrently on this thread.
+        // Populated by UI via Launcher.search(); tick materializes results and
+        // wakes the GUI so the next frame sees them.
+        const had_pending = blk: {
+            self.launcher.mu.lockUncancelable(self.io);
+            const n = self.launcher.pending.items.len;
+            self.launcher.mu.unlock(self.io);
+            break :blk n > 0;
+        };
+        if (had_pending) {
+            self.launcher.tick() catch |e| {
+                std.log.err("Launcher error {s}", .{@errorName(e)});
+            };
+            self.requestRefresh();
+        }
         const conn = self.ensureConn(io, &next_connect_ms) orelse {
             io.sleep(.fromMilliseconds(200), .awake) catch return;
             continue;

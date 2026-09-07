@@ -83,4 +83,21 @@ pub fn build(b: *std.Build) void {
 
     const test_state_step = b.step("test-state", "Run State tests (no GUI)");
     test_state_step.dependOn(&run_state_tests.step);
+
+    // Headless Launcher parser tests – also link-light via dvui_shim
+    const launcher_test_module = b.createModule(.{
+        .root_source_file = b.path("src/Launcher.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    launcher_test_module.addImport("dvui", dvui_shim);
+    const launcher_tests = b.addTest(.{
+        .root_module = launcher_test_module,
+        .use_llvm = llvm,
+        .use_lld = lld,
+    });
+    const run_launcher_tests = b.addRunArtifact(launcher_tests);
+    const test_launcher_step = b.step("test-launcher", "Run Launcher parser tests (no GUI)");
+    test_launcher_step.dependOn(&run_launcher_tests.step);
+    test_state_step.dependOn(&run_launcher_tests.step);
 }

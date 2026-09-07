@@ -14,6 +14,7 @@ const Ui = struct {
     // Set when the switcher opens; hubFrame hands keyboard focus to the
     // selected button once so Tab/Enter work without a first Tab press.
     windows_need_focus: bool = false,
+    launcher_need_focus: bool = false,
 
     pub const HubMode = enum {
         clock,
@@ -44,9 +45,22 @@ const Ui = struct {
                 self.windows_need_focus = true;
             }
         }
+        if (mode == .launcher) {
+            if (self.hubmode != .launcher) {
+                self.launcher_need_focus = true;
+                self.last_hubmode = self.hubmode;
+            }
+        }
+        // Remember where we came from so Esc/launcher close returns.
+        if (mode != .launcher and mode != .windows and self.hubmode == .launcher) {
+            // leaving launcher keeps last_hubmode as is
+        } else if (mode != .windows and mode != .launcher) {
+            self.last_hubmode = mode;
+        }
         self.hubmode = mode;
         setTarget(switch (mode) {
             .windows => .{ .w = 600, .h = 120 },
+            .launcher => .{ .w = 520, .h = 360 },
             .clock => .{ .w = 150, .h = 50 },
             else => .{ .w = 480, .h = 180 },
         });
@@ -185,6 +199,8 @@ pub fn main(init: std.process.Init) !u8 {
 
     try state.initWithWakeup(gpa, io, &win_bar, &requestDvuiRefresh);
     defer state.deinit();
+    // Populate launcher list (uses arena alloc, non-fatal if dirs missing).
+    state.launcher.loadList(init) catch |e| std.log.warn("launcher load: {s}", .{@errorName(e)});
 
     // Worker after init (it spins until `inited`), cancelled before deinit
     // frees the model: LIFO defers run cancel first.
@@ -431,11 +447,11 @@ pub fn hubFrame() !dvui.App.Result {
     });
     defer outer.deinit();
 
-    if (state.launcher_open and ui.hubmode != .launcher) {
+    if (state.launcher_open and ui.hubmode != .windows) {
         // Compositor MOD press (nile focuses this surface and pushes
         // launcher_opened): open the switcher. nshell never learns which
         // key MOD is — this level is the only MOD-derived signal consumed.
-        ui.switchMode(.launcher);
+        ui.switchMode(.windows);
     } else if (!state.launcher_open and launcher_was_open and ui.hubmode == .windows) {
         // Compositor MOD release: activate the selection, then dismiss.
         // Runs before the focus-loss dismiss below so the selection isn't
@@ -458,6 +474,16 @@ pub fn hubFrame() !dvui.App.Result {
                 selected += 1;
             }
             break;
+        }
+        // Manual launcher trigger for demo (no compositor MOD needed):
+        // '/' or Ctrl+P opens the app launcher that demos Launcher.search flow.
+        if (ev.evt == .key and ev.evt.key.action == .down) {
+            if (ev.evt.key.code == .slash or ev.evt.key.code == .p) {
+                if (ui.hubmode != .launcher) {
+                    ui.switchMode(.launcher);
+                    break;
+                }
+            }
         }
     }
 
@@ -557,8 +583,19 @@ pub fn hubFrame() !dvui.App.Result {
                     .padding = .{ .h = 6 },
                 },
             );
-            if (clicked)
+            // second click opens launcher demo
+            if (clicked) {
+                // Left click on clock cycles windows; right-click or extra button opens launcher
                 ui.switchMode(.windows);
+            }
+            // Small launcher button below clock
+            {
+                var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .gravity_x = 0.5 });
+                defer row.deinit();
+                if (dvui.button(@src(), "Launcher  \u{2318}P / /", .{}, .{ .min_size_content = .{ .h = 18 } })) {
+                    ui.switchMode(.launcher);
+                }
+            }
         },
         .windows => {
             const list = dvui.flexbox(
@@ -665,7 +702,124 @@ pub fn hubFrame() !dvui.App.Result {
                 selected = h;
             }
         },
-        else => ui.switchMode(.clock),
+        .launcher => {
+            // Example launcher that demos the async search flow:
+            // UI thread calls `state.launcher.search(term)` which returns
+            // cached results immediately or null + enqueues term.
+            // State worker's `launcher.tick()` materializes results
+            // concurrently, then wakes the GUI.
+            var vbox = dvui.box(@src(), .{ .dir = .vertical }, .{
+                .expand = .both,
+                .background = false,
+                .padding = .all(4),
+            });
+            defer vbox.deinit();
+
+            const q = blk: {
+                var te = dvui.textEntry(@src(), .{
+                    .placeholder = "Type app name… (name > description > category > command)",
+                }, .{
+                    .expand = .horizontal,
+                });
+                defer te.deinit();
+                if (ui.launcher_need_focus) {
+                    dvui.focusWidget(te.data().id, null, null);
+                    ui.launcher_need_focus = false;
+                }
+                break :blk te.getText();
+            };
+
+            // Enqueue + fetch (null while pending).
+            const results = state.launcher.search(q);
+
+            // ESC dismisses launcher, Enter launches top hit
+            for (dvui.events()) |ev| {
+                if (ev.evt == .key and ev.evt.key.code == .escape and ev.evt.key.action == .down) {
+                    ui.switchMode(ui.last_hubmode);
+                    break;
+                }
+                if (ev.evt == .key and ev.evt.key.code == .enter and ev.evt.key.action == .down) {
+                    if (results) |apps| {
+                        if (apps.len > 0) {
+                            var idx: usize = 0;
+                            for (state.launcher.data.items, 0..) |*a, j| if (a == apps[0]) {
+                                idx = j;
+                                break;
+                            };
+                            state.launcher.run(idx);
+                            ui.switchMode(ui.last_hubmode);
+                        }
+                    }
+                }
+            }
+
+            var scroll = dvui.scrollArea(@src(), .{}, .{
+                .expand = .both,
+                .background = false,
+                .padding = .all(2),
+            });
+            defer scroll.deinit();
+
+            if (results) |apps| {
+                if (apps.len == 0) {
+                    if (q.len == 0) {
+                        dvui.labelNoFmt(@src(), "No apps loaded", .{}, .{ .color_text = t.color(.content, .text).opacity(0.6) });
+                    } else {
+                        dvui.labelNoFmt(@src(), "No results", .{}, .{ .color_text = t.color(.content, .text).opacity(0.6) });
+                    }
+                } else {
+                    for (apps, 0..) |app, i| {
+                        var btn: dvui.ButtonWidget = undefined;
+                        btn.init(@src(), .{}, .{
+                            .expand = .horizontal,
+                            .background = true,
+                            .color_fill = base,
+                            .color_fill_hover = base.lighten(5),
+                            .border = .all(1),
+                            .color_border = t.color(.content, .text).opacity(0.08),
+                            .corners = .all(6),
+                            .padding = .all(6),
+                            .margin = .{ .y = 2, .x = 2 },
+                            .id_extra = i,
+                        });
+                        btn.processEvents();
+                        btn.drawBackground();
+                        defer btn.deinit();
+                        if (btn.clicked()) {
+                            var idx: usize = 0;
+                            for (state.launcher.data.items, 0..) |*a, j| if (a == app) {
+                                idx = j;
+                                break;
+                            };
+                            state.launcher.run(idx);
+                            ui.switchMode(ui.last_hubmode);
+                        }
+                        var row2 = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .background = false });
+                        defer row2.deinit();
+                        dvui.labelNoFmt(@src(), app.name, .{}, .{ .font = t.font_title.withSize(11) });
+                        var meta = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .background = false });
+                        defer meta.deinit();
+                        if (app.comment) |c| {
+                            dvui.labelNoFmt(@src(), c, .{}, .{ .font = t.font_body.withSize(9), .color_text = t.color(.content, .text).opacity(0.6) });
+                        } else if (app.generic_name) |g| {
+                            dvui.labelNoFmt(@src(), g, .{}, .{ .font = t.font_body.withSize(9), .color_text = t.color(.content, .text).opacity(0.6) });
+                        }
+                        if (app.categories) |cats| {
+                            _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 6 } });
+                            dvui.labelNoFmt(@src(), cats, .{}, .{ .font = t.font_body.withSize(8), .color_text = t.color(.highlight, .fill) });
+                        }
+                        if (app.exec) |e| {
+                            _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 6 } });
+                            dvui.labelNoFmt(@src(), e, .{}, .{ .font = t.font_mono.withSize(8), .color_text = t.color(.content, .text).opacity(0.45) });
+                        }
+                    }
+                }
+            } else {
+                dvui.labelNoFmt(@src(), if (q.len == 0) "Type to search…" else "Searching…", .{}, .{ .color_text = t.color(.content, .text).opacity(0.6) });
+            }
+        },
+        .search => ui.switchMode(.launcher),
+        .wifi => ui.switchMode(.clock),
     }
 
     return .ok;
