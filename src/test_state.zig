@@ -148,30 +148,28 @@ test "state: query, broadcast override, actions, images via 2-way connection" {
     }
     try t.expect(ctx.shell_registered.load(.seq_cst));
 
-    // Launcher pushes (compositor MOD press/release) flip the switcher
-    // flag hubFrame edge-detects on.
+    // Launcher pushes (compositor MOD tap) are for the app launcher,
+    // not the window switcher — State intentionally ignores them for
+    // switcher; hubFrame would own a simple local hub_* var if needed.
+    // Verify they are harmless and don't affect switcher state.
     {
         var ev: proto.Event = .{ .launcher_opened = {} };
         defer ev.deinit(alloc);
         try server.broadcastCompositorEventDefault(ev);
     }
-    tries = 0;
-    while (!state.launcher_open and tries < 500) : (tries += 1) {
-        state.update();
-        io.sleep(.fromMilliseconds(10), .awake) catch {};
-    }
-    try t.expect(state.launcher_open);
     {
         var ev: proto.Event = .{ .launcher_closed = {} };
         defer ev.deinit(alloc);
         try server.broadcastCompositorEventDefault(ev);
     }
+    // Drain them; no launcher_open field to check — just ensure update
+    // doesn't crash and model stays intact.
     tries = 0;
-    while (state.launcher_open and tries < 500) : (tries += 1) {
+    while (tries < 20) : (tries += 1) {
         state.update();
         io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
-    try t.expect(!state.launcher_open);
+    try t.expectEqual(@as(usize, 1), state.windows.len);
 
     // Broadcast overrides current state without any new request.
     {

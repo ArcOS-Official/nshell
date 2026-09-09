@@ -118,11 +118,9 @@ io: std.Io = undefined,
 workspaces: []proto.Workspace = &.{},
 windows: []proto.Window = &.{},
 
-// Compositor-driven switcher state. Set by launcher_opened/launcher_closed
-// pushes (MOD press/release in ../nile); hubFrame edge-detects on this to
-// open the switcher and activate the selection. Plain bool: only touched
-// by the UI thread in update(), read by frame code.
-launcher_open: bool = false,
+// (launcher_opened/launcher_closed are compositor MOD-tap gestures for
+// the app launcher — see nile doc "Shell launcher". They are not switcher
+// state; hubFrame owns its own simple hub_* var if it needs one.)
 
 // UI-thread thumbnail cache (see ImageEntry).
 images: ImageMap = undefined,
@@ -191,7 +189,6 @@ pub fn initWithWakeup(
     self.io = io;
     self.workspaces = &.{};
     self.windows = &.{};
-    self.launcher_open = false;
     self.images = ImageMap.init(alloc);
     self.req_q = .{};
     self.commit_q = .{};
@@ -898,12 +895,11 @@ fn applyEvent(self: *State, ev: *proto.Event) void {
         .switch_workspace => |v| {
             for (self.workspaces) |*ws| ws.current = (ws.number == v.index);
         },
-        // Compositor MOD-tap gesture (see ../nile Seat.shellModTap):
-        // launcher_opened on MOD press, launcher_closed on release.
-        // Flips the level hubFrame edge-detects to open/activate the
-        // switcher — the only MOD-derived signal nshell consumes.
-        .launcher_opened => self.launcher_open = true,
-        .launcher_closed => self.launcher_open = false,
+        // MOD-tap launcher gesture (see ../nile Seat.shellModTap):
+        // launcher_opened/launcher_closed are for the app launcher, not
+        // the window switcher. hubFrame owns its own simple hub_* var
+        // (like hub_keyboard_focused) if it wants local switcher state.
+        .launcher_opened, .launcher_closed => {},
         else => {},
     }
 }
