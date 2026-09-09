@@ -35,22 +35,29 @@ const reconnect_ms: i64 = 1500;
 const loop_sleep_ms: u64 = 25;
 
 // UI -> worker requests. Plain data: the worker sends them with
-// `requestCompositor` on its own connection. Mutations (switch/focus/close)
-// are acked with `pong`; the outcome arrives later as a broadcast push.
+// `requestCompositor` on its own connection. Mutations (switch/focus/close
+// and floating/tiling) are acked with `pong`; the outcome arrives later as
+// a broadcast push.
 const Action = union(enum) {
     switch_workspace: u64,
     focus_window: u64,
     capture_window: CaptureWindow,
     get_window: u64,
+    set_window_floating: SetWindowFloating,
+    set_workspace_mode: SetWorkspaceMode,
+    set_focus_config: SetFocusConfig,
 
     pub const CaptureWindow = struct {
         id: u64,
         scale: u32,
     };
+    pub const SetWindowFloating = struct { id: u64, floating: bool };
+    pub const SetWorkspaceMode = struct { id: u64, mode: proto.WorkspaceMode };
+    pub const SetFocusConfig = struct { switch_workspace_on_focus: bool };
 
     fn deinit(self: *Action, alloc: std.mem.Allocator) void {
-        // No heap today (all payloads are u64s); kept for symmetry with
-        // proto.Request so drops stay leak-free if that changes.
+        // No heap today (all payloads are plain data); kept for symmetry
+        // with proto.Request so drops stay leak-free if that changes.
         _ = self;
         _ = alloc;
     }
@@ -159,6 +166,12 @@ capture_backoff_until_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
 // ../nile paths above).
 socket_path_override: ?[]const u8 = null,
 
+// Focus-window behaviour: whether focusing a window on another workspace
+// should switch to it. Mirrors Nile's Bank.focus_switches_workspace
+// (set_focus_config). Default `true` — alt-tab anywhere. Shell can set
+// `false` to keep alt-tab within the current workspace only.
+focus_switches_workspace: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+
 // Wakeup hook: invoked every time commits land so the GUI redraws promptly.
 // main.zig wires it to dvui.refresh.
 wakeup_ctx: ?*anyopaque = null,
@@ -199,6 +212,7 @@ pub fn initWithWakeup(
     self.worker_done = std.atomic.Value(bool).init(false);
     self.closed = std.atomic.Value(bool).init(false);
     self.capture_backoff_until_ms = std.atomic.Value(i64).init(0);
+    self.focus_switches_workspace = std.atomic.Value(bool).init(true);
     self.wakeup_ctx = wakeup_ctx;
     self.wakeup_fn = wakeup_fn;
     self.launcher.init(alloc, io);
@@ -243,6 +257,94 @@ pub fn switchWorkspace(self: *State, id: u64) void {
 
 pub fn focusWindow(self: *State, id: u64) void {
     self.req_q.push(self.alloc, self.io, .{ .focus_window = id });
+}
+
+// ---------------------------------------------------------------------------
+// Floating / tiling controls via nilebank
+// Mirrors nile/Nile.zig + Bank.set_window_floating / set_workspace_mode /
+// set_focus_config. All enqueued for the worker and acked with pong;
+// visible outcome arrives as broadcast pushes (window_floating_changed,
+// workspace_mode_changed, window_state_changed).
+// ---------------------------------------------------------------------------
+
+/// Set a window's floating flag directly.
+pub fn setWindowFloating(self: *State, id: u64, floating: bool) void {
+    self.req_q.push(self.alloc, self.io, .{ .set_window_floating = .{ .id = id, .floating = floating } });
+}
+
+/// Toggle a window's floating state (reads current model; falls back to true).
+pub fn toggleWindowFloating(self: *State, id: u64) void {
+    const cur = if (self.findWindow(id)) |w| w.floating else false;
+    self.setWindowFloating(id, !cur);
+}
+
+/// Convenience: toggle the currently focused window (MRU head if focused flag missing).
+pub fn toggleFocusedWindowFloating(self: *State) void {
+    if (self.windows.len == 0) return;
+    const id = for (self.windows) |*w| {
+        if (w.focused) break w.id;
+    } else self.windows[0].id;
+    self.toggleWindowFloating(id);
+}
+
+/// Set a workspace's tiling/floating mode explicitly.
+pub fn setWorkspaceMode(self: *State, id: u64, mode: proto.WorkspaceMode) void {
+    self.req_q.push(self.alloc, self.io, .{ .set_workspace_mode = .{ .id = id, .mode = mode } });
+}
+
+/// Toggle a workspace's mode (reads current model; tiling -> floating).
+pub fn toggleWorkspaceMode(self: *State, id: u64) void {
+    const cur = self.getWorkspaceMode(id) orelse .tiling;
+    const next: proto.WorkspaceMode = if (cur == .tiling) .floating else .tiling;
+    self.setWorkspaceMode(id, next);
+}
+
+/// Toggle the current workspace (current == active/current flag).
+pub fn toggleCurrentWorkspaceMode(self: *State) void {
+    const cur_id = self.currentWorkspaceId() orelse return;
+    self.toggleWorkspaceMode(cur_id);
+}
+
+/// Set the current workspace's mode directly.
+pub fn setCurrentWorkspaceMode(self: *State, mode: proto.WorkspaceMode) void {
+    const cur_id = self.currentWorkspaceId() orelse return;
+    self.setWorkspaceMode(cur_id, mode);
+}
+
+/// Whether focusing a window on another workspace should switch to it.
+/// Mirrors Nile Bank's `focus_switches_workspace`. Default `true`
+/// (alt-tab anywhere).
+pub fn getFocusSwitchesWorkspace(self: *State) bool {
+    return self.focus_switches_workspace.load(.seq_cst);
+}
+pub fn setFocusConfig(self: *State, switch_workspace_on_focus: bool) void {
+    self.focus_switches_workspace.store(switch_workspace_on_focus, .seq_cst);
+    self.req_q.push(self.alloc, self.io, .{ .set_focus_config = .{ .switch_workspace_on_focus = switch_workspace_on_focus } });
+}
+/// Inverse convenience: only_current = !switch_workspace_on_focus.
+pub fn getOnlyCurrentWorkspace(self: *State) bool {
+    return !self.getFocusSwitchesWorkspace();
+}
+pub fn setOnlyCurrentWorkspace(self: *State, only_current: bool) void {
+    self.setFocusConfig(!only_current);
+}
+
+/// Helpers for UI: read current model.
+pub fn getWorkspaceMode(self: *State, id: u64) ?proto.WorkspaceMode {
+    for (self.workspaces) |*ws| if (ws.id == id) return ws.mode;
+    return null;
+}
+pub fn getWindowFloating(self: *State, id: u64) ?bool {
+    if (self.findWindow(id)) |w| return w.floating;
+    return null;
+}
+pub fn currentWorkspaceId(self: *State) ?u64 {
+    for (self.workspaces) |*ws| if (ws.current or ws.active) return ws.id;
+    return null;
+}
+pub fn currentWorkspaceMode(self: *State) ?proto.WorkspaceMode {
+    const id = self.currentWorkspaceId() orelse return null;
+    return self.getWorkspaceMode(id);
 }
 
 // UI thread only. Returns the cached capture for `id` as a dvui.ImageSource
@@ -582,6 +684,18 @@ fn handleAction(self: *State, conn: *nilebank.Connection, a: *Action) !void {
             }
             if (!consumed) ev.deinit(self.alloc);
         },
+        .set_window_floating => |v| {
+            var ev = try conn.requestCompositor(.{ .set_window_floating = .{ .id = v.id, .floating = v.floating } }, .raw);
+            defer ev.deinit(self.alloc);
+        },
+        .set_workspace_mode => |v| {
+            var ev = try conn.requestCompositor(.{ .set_workspace_mode = .{ .id = v.id, .mode = v.mode } }, .raw);
+            defer ev.deinit(self.alloc);
+        },
+        .set_focus_config => |v| {
+            var ev = try conn.requestCompositor(.{ .set_focus_config = .{ .switch_workspace_on_focus = v.switch_workspace_on_focus } }, .raw);
+            defer ev.deinit(self.alloc);
+        },
     }
 }
 
@@ -894,6 +1008,20 @@ fn applyEvent(self: *State, ev: *proto.Event) void {
         },
         .switch_workspace => |v| {
             for (self.workspaces) |*ws| ws.current = (ws.number == v.index);
+        },
+        .window_floating_changed => |v| {
+            const created = self.ensureWindow(v.id);
+            const rec = self.findWindow(v.id) orelse return;
+            rec.floating = v.floating;
+            if (created) self.req_q.push(self.alloc, self.io, .{ .get_window = v.id });
+        },
+        .workspace_mode_changed => |v| {
+            for (self.workspaces) |*ws| if (ws.id == v.id) {
+                ws.mode = v.mode;
+                return;
+            };
+            // Unknown workspace: fetch via upsert fallback (rare).
+            // Leave as-is; next full list will converge.
         },
         // MOD-tap launcher gesture (see ../nile Seat.shellModTap):
         // launcher_opened/launcher_closed are for the app launcher, not
