@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const dvui = @import("dvui");
 
 /// Owned list of desktop entries.
@@ -8,12 +9,32 @@ data: std.ArrayList(App) = .empty,
 query: std.StringHashMapUnmanaged(?[]*App) = .empty,
 /// Terms waiting to be searched by tick() on the worker thread.
 pending: std.ArrayList([]const u8) = .empty,
+/// Icon cache: icon name -> resolved data (null = pending).
+/// Key is owned dupe of the Icon= string; bytes/path owned. Empty bytes = missing (negative cache).
+icon_cache: std.StringHashMapUnmanaged(?IconData) = .empty,
+/// Icon names waiting to be resolved by tickIcons() on the worker thread.
+icon_pending: std.ArrayList([]const u8) = .empty,
+/// Cached ordered theme dirs: owned absolute paths, hicolor first.
+/// Built lazily on the worker thread; empty = not built yet.
+icon_theme_dirs: std.ArrayList([]const u8) = .empty,
+icon_themes_built: bool = false,
+/// Owned HOME dir (for ~/.local/share/icons). Captured in loadList().
+home_dir: ?[]const u8 = null,
 mu: std.Io.Mutex = .init,
 alloc: std.mem.Allocator = undefined,
 io: std.Io = undefined,
 inited: bool = false,
 
 const Launcher = @This();
+
+pub const icon_px: u32 = 32;
+
+pub const IconData = struct {
+    /// Owned file bytes (stb-compatible raster, e.g. PNG). Empty when missing.
+    bytes: []const u8,
+    /// Owned resolved absolute path. Empty when missing.
+    path: []const u8,
+};
 
 pub const App = struct {
     name: []const u8,
@@ -24,7 +45,24 @@ pub const App = struct {
     path: ?[]const u8 = null,
     exec: ?[]const u8 = null,
     icon: []const u8,
+    icon_path: ?[]const u8 = null,
     terminal: bool = false,
+
+    /// Vector icon (TVG bytes) for dvui.icon(). Not supported yet (raster
+    /// only) — always null so callers fall through to iconImage().
+    pub fn iconTvg(self: *const App, launcher: *Launcher) ?[]const u8 {
+        _ = self;
+        _ = launcher;
+        return null;
+    }
+
+    /// Raster icon for dvui.image(). Non-blocking: cached bytes or null +
+    /// enqueue. Bytes borrow cache memory (valid until deinit; no eviction).
+    pub fn iconImage(self: *const App, launcher: *Launcher) ?dvui.ImageSource {
+        const data = launcher.requestIcon(self.icon) orelse return null;
+        if (data.bytes.len == 0) return null;
+        return .{ .imageFile = .{ .bytes = data.bytes, .name = data.path } };
+    }
 };
 
 const ParsedApp = struct {
@@ -81,6 +119,20 @@ pub fn deinit(self: *Launcher) void {
     self.query.deinit(self.alloc);
     // pending items are same pointers as keys; don't double free.
     self.pending.deinit(self.alloc);
+    var iit = self.icon_cache.iterator();
+    while (iit.next()) |kv| {
+        self.alloc.free(kv.key_ptr.*);
+        if (kv.value_ptr.*) |d| {
+            if (d.bytes.len > 0) self.alloc.free(d.bytes);
+            if (d.path.len > 0) self.alloc.free(d.path);
+        }
+    }
+    self.icon_cache.deinit(self.alloc);
+    // icon_pending items alias icon_cache keys; don't double free.
+    self.icon_pending.deinit(self.alloc);
+    for (self.icon_theme_dirs.items) |d| self.alloc.free(d);
+    self.icon_theme_dirs.deinit(self.alloc);
+    if (self.home_dir) |h| self.alloc.free(h);
     self.* = .{};
 }
 
@@ -129,6 +181,9 @@ fn parseDesktopData(
     // Ensure we clean up on early return for non-Application types.
     var in_desktop_entry = false;
     var seen_desktop_entry = false;
+    // Freedesktop Hidden/NoDisplay: kept as locals, never stored on App.
+    var hidden = false;
+    var nodisplay = false;
 
     var lines = std.mem.splitSequence(u8, data, "\n");
     while (lines.next()) |line_raw| {
@@ -235,11 +290,28 @@ fn parseDesktopData(
             app.icon = try alloc.dupe(u8, val_raw);
         } else if (std.mem.eql(u8, key, "Terminal")) {
             app.terminal = std.mem.eql(u8, val_raw, "true") or std.mem.eql(u8, val_raw, "True") or std.mem.eql(u8, val_raw, "1");
+        } else if (std.mem.eql(u8, key, "Hidden")) {
+            hidden = std.mem.eql(u8, val_raw, "true") or std.mem.eql(u8, val_raw, "True") or std.mem.eql(u8, val_raw, "1");
+        } else if (std.mem.eql(u8, key, "NoDisplay")) {
+            nodisplay = std.mem.eql(u8, val_raw, "true") or std.mem.eql(u8, val_raw, "True") or std.mem.eql(u8, val_raw, "1");
         } else {
             // Unknown key – intentionally silent; locale keys like Name[ar] are
             // already handled via stripping, so this won't warn for "ar".
             continue;
         }
+    }
+
+    // Hidden/NoDisplay entries are never shown: skip the file entirely.
+    if (hidden or nodisplay) {
+        if (app.name) |v| alloc.free(v);
+        if (app.icon) |v| alloc.free(v);
+        if (app.categories) |v| alloc.free(v);
+        if (app.version) |v| alloc.free(v);
+        if (app.generic_name) |v| alloc.free(v);
+        if (app.comment) |v| alloc.free(v);
+        if (app.path) |v| alloc.free(v);
+        if (app.exec) |v| alloc.free(v);
+        return;
     }
 
     const a = unNullify(app) orelse {
@@ -307,6 +379,7 @@ pub fn loadList(self: *Launcher, pinit: std.process.Init) !void {
     defer if (home) |h| alloc.free(h);
     if (pinit.environ_map.get("HOME")) |h| {
         home = try std.fmt.allocPrint(alloc, "{s}/.local/share/applications", .{h});
+        if (self.home_dir == null) self.home_dir = try alloc.dupe(u8, h);
     }
     if (home) |h|
         self.addDir(alloc, pinit.io, h) catch |e| {
@@ -422,6 +495,282 @@ pub fn tick(self: *Launcher) !void {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Icons – async cached freedesktop lookup, fixed 32px with auto-scale fallback
+//
+// UI never touches the filesystem: App.iconImage() returns cached bytes or
+// null + enqueues the name. The worker resolves via tickIcons() and wakes
+// the GUI. Positive and negative results are cached, so each unique Icon=
+// name stats the disk once. Theme order is hicolor first, then every other
+// subdir of each icons dir (alphabetical). Within a theme, 32x32 is
+// preferred; other sizes are fallback and the GPU scales them into the
+// fixed 32px slot (dvui.image shrink + fixed widget size).
+// Only stb-compatible raster (.png/.jpg) is returned; .svg/.xpm resolve to
+// missing (placeholder) for now.
+// ---------------------------------------------------------------------------
+
+const icon_size_dirs = [_][]const u8{
+    "32x32", "32x32@2", "24x24", "48x48", "36x36", "22x22",
+    "16x16", "64x64", "24x24@2", "48x48@2", "128x128",
+    "256x256", "512x512",
+};
+// NOTE: "scalable" omitted on purpose — it holds .svg only, which the
+// raster pipeline can't use; probing it would only burn stats.
+
+const icon_exts = [_][]const u8{ ".png", ".jpg" };
+
+const max_icon_bytes: usize = 2 * 1024 * 1024;
+
+/// Non-blocking UI-side lookup. Returns resolved data (copy of slice
+/// headers; memory owned by the cache) or null when pending/missing.
+/// On unknown names enqueues for the worker and returns null.
+pub fn requestIcon(self: *Launcher, name: []const u8) ?IconData {
+    if (!self.inited or name.len == 0) return null;
+    self.mu.lockUncancelable(self.io);
+    defer self.mu.unlock(self.io);
+    if (self.icon_cache.get(name)) |cached| {
+        return cached;
+    }
+    const key = self.alloc.dupe(u8, name) catch return null;
+    self.icon_cache.put(self.alloc, key, null) catch {
+        self.alloc.free(key);
+        return null;
+    };
+    self.icon_pending.append(self.alloc, key) catch {
+        _ = self.icon_cache.remove(key);
+        self.alloc.free(key);
+        return null;
+    };
+    return null;
+}
+
+fn dirExists(self: *Launcher, path: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(self.io, path, .{ .iterate = false }) catch return false;
+    dir.close(self.io);
+    return true;
+}
+
+fn fileExists(self: *Launcher, path: []const u8) bool {
+    var f = std.Io.Dir.openFileAbsolute(self.io, path, .{ .mode = .read_only }) catch return false;
+    f.close(self.io);
+    return true;
+}
+
+/// Build ordered theme dirs once: hicolor first across all bases, then all
+/// other subdirs (alphabetical) per base, pixmaps last. Called on worker.
+fn ensureIconThemeDirs(self: *Launcher) void {
+    {
+        self.mu.lockUncancelable(self.io);
+        const built = self.icon_themes_built;
+        self.mu.unlock(self.io);
+        if (built) return;
+    }
+    var bases: std.ArrayList([]const u8) = .empty;
+    defer bases.deinit(self.alloc);
+    if (self.home_dir) |h| {
+        if (std.fmt.allocPrint(self.alloc, "{s}/.local/share/icons", .{h}) catch null) |p| {
+            bases.append(self.alloc, p) catch self.alloc.free(p);
+        }
+    }
+    for ([_][]const u8{ "/usr/local/share/icons", "/usr/share/icons" }) |b| {
+        bases.append(self.alloc, b) catch {};
+    }
+
+    var ordered: std.ArrayList([]const u8) = .empty;
+    defer ordered.deinit(self.alloc);
+
+    // Hicolor first across all bases.
+    for (bases.items) |b| {
+        const p = std.fmt.allocPrint(self.alloc, "{s}/hicolor", .{b}) catch continue;
+        if (self.dirExists(p)) {
+            ordered.append(self.alloc, p) catch self.alloc.free(p);
+        } else self.alloc.free(p);
+    }
+    // Then every other theme subdir, alphabetical per base for determinism.
+    for (bases.items) |b| {
+        var dir = std.Io.Dir.openDirAbsolute(self.io, b, .{ .iterate = true }) catch continue;
+        defer dir.close(self.io);
+        var names: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (names.items) |n| self.alloc.free(n);
+            names.deinit(self.alloc);
+        }
+        var iter = dir.iterate();
+        while (iter.next(self.io) catch null) |e| {
+            if (e.kind != .directory) continue;
+            if (std.mem.eql(u8, e.name, "hicolor")) continue;
+            names.append(self.alloc, self.alloc.dupe(u8, e.name) catch continue) catch continue;
+        }
+        // Insertion sort (theme counts are small).
+        if (names.items.len > 1) {
+            for (1..names.items.len) |i| {
+                var j = i;
+                while (j > 0 and std.mem.order(u8, names.items[j], names.items[j - 1]) == .lt) {
+                    std.mem.swap([]const u8, &names.items[j], &names.items[j - 1]);
+                    j -= 1;
+                }
+            }
+        }
+        for (names.items) |n| {
+            const p = std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ b, n }) catch continue;
+            ordered.append(self.alloc, p) catch self.alloc.free(p);
+        }
+    }
+    // Pixmaps last (flat dirs, no themes/sizes).
+    if (self.home_dir) |h| {
+        if (std.fmt.allocPrint(self.alloc, "{s}/.local/share/pixmaps", .{h}) catch null) |p| {
+            if (self.dirExists(p)) ordered.append(self.alloc, p) catch self.alloc.free(p) else self.alloc.free(p);
+        }
+    }
+    for ([_][]const u8{ "/usr/local/share/pixmaps", "/usr/share/pixmaps" }) |p| {
+        if (self.dirExists(p)) {
+            const owned = self.alloc.dupe(u8, p) catch continue;
+            ordered.append(self.alloc, owned) catch self.alloc.free(owned);
+        }
+    }
+
+    // Free the one home-derived base we allocated; static strings stay.
+    for (bases.items) |b| {
+        if (b.len > 0 and b[0] != '/') continue;
+        if (self.home_dir != null and std.mem.startsWith(u8, b, self.home_dir.?)) self.alloc.free(b);
+    }
+
+    self.mu.lockUncancelable(self.io);
+    defer self.mu.unlock(self.io);
+    if (self.icon_themes_built) {
+        for (ordered.items) |d| self.alloc.free(d);
+        return;
+    }
+    for (ordered.items) |d| self.icon_theme_dirs.append(self.alloc, d) catch self.alloc.free(d);
+    self.icon_themes_built = true;
+}
+
+fn hasImageExt(name: []const u8) bool {
+    for (icon_exts) |e| if (std.mem.endsWith(u8, name, e)) return true;
+    return std.mem.endsWith(u8, name, ".svg") or std.mem.endsWith(u8, name, ".xpm");
+}
+
+/// Only stb-decodable raster may reach dvui.imageFile; vector/xpm would
+/// fail decode every frame, so resolve them to missing (placeholder).
+fn isRasterPath(path: []const u8) bool {
+    for (icon_exts) |e| if (std.mem.endsWith(u8, path, e)) return true;
+    return false;
+}
+
+/// Resolve one icon name to an owned absolute path. Caller owns result.
+/// Returns null when missing or unsupported (e.g. svg-only).
+fn resolveIconPath(self: *Launcher, name: []const u8) ?[]const u8 {
+    if (name.len == 0) return null;
+    // Absolute path: use directly (try as-is, then + .png when extensionless).
+    if (std.mem.indexOfScalar(u8, name, '/') != null) {
+        if (std.mem.startsWith(u8, name, "/")) {
+            if (hasImageExt(name)) {
+                if (self.fileExists(name)) return self.alloc.dupe(u8, name) catch null;
+                return null;
+            }
+            var buf: [1024]u8 = undefined;
+            for (icon_exts) |e| {
+                const cand = std.fmt.bufPrint(&buf, "{s}{s}", .{ name, e }) catch continue;
+                if (self.fileExists(cand)) return self.alloc.dupe(u8, cand) catch null;
+            }
+            if (self.fileExists(name)) return self.alloc.dupe(u8, name) catch null;
+        }
+        return null;
+    }
+    // Shallow snapshot of theme dirs (slice only; strings stay owned by the
+    // cache until deinit, which runs after the worker stops, so borrowing
+    // them across IO without the lock is safe).
+    self.mu.lockUncancelable(self.io);
+    const dirs = self.icon_theme_dirs.items;
+    const owned = self.alloc.dupe([]const u8, dirs) catch &.{};
+    self.mu.unlock(self.io);
+    defer self.alloc.free(owned);
+    var buf: [1024]u8 = undefined;
+    const with_ext = hasImageExt(name);
+    for (owned) |theme| {
+        const is_pixmaps = std.mem.endsWith(u8, theme, "pixmaps");
+        if (is_pixmaps) {
+            if (with_ext) {
+                const cand = std.fmt.bufPrint(&buf, "{s}/{s}", .{ theme, name }) catch continue;
+                if (self.fileExists(cand)) return self.alloc.dupe(u8, cand) catch null;
+                continue;
+            }
+            for (icon_exts) |e| {
+                const cand = std.fmt.bufPrint(&buf, "{s}/{s}{s}", .{ theme, name, e }) catch continue;
+                if (self.fileExists(cand)) return self.alloc.dupe(u8, cand) catch null;
+            }
+            continue;
+        }
+        for (icon_size_dirs) |size| {
+            if (with_ext) {
+                const cand = std.fmt.bufPrint(&buf, "{s}/{s}/apps/{s}", .{ theme, size, name }) catch continue;
+                if (self.fileExists(cand)) return self.alloc.dupe(u8, cand) catch null;
+                continue;
+            }
+            for (icon_exts) |e| {
+                const cand = std.fmt.bufPrint(&buf, "{s}/{s}/apps/{s}{s}", .{ theme, size, name, e }) catch continue;
+                if (self.fileExists(cand)) return self.alloc.dupe(u8, cand) catch null;
+            }
+        }
+    }
+    return null;
+}
+
+fn readIconBytes(self: *Launcher, path: []const u8) ?[]const u8 {
+    var file = std.Io.Dir.openFileAbsolute(self.io, path, .{ .mode = .read_only }) catch return null;
+    defer file.close(self.io);
+    const stat = file.stat(self.io) catch return null;
+    if (stat.size == 0 or stat.size > max_icon_bytes) return null;
+    var rd = file.reader(self.io, &.{});
+    return rd.interface.readAlloc(self.alloc, stat.size) catch null;
+}
+
+/// Worker-thread side: resolve up to max_per_tick pending icons.
+/// Never called from the UI thread (does filesystem IO).
+pub fn tickIcons(self: *Launcher, max_per_tick: usize) !void {
+    if (!self.inited) return;
+    self.ensureIconThemeDirs();
+    var batch: std.ArrayList([]const u8) = .empty;
+    defer batch.deinit(self.alloc);
+    {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        if (self.icon_pending.items.len == 0) return;
+        const n = @min(max_per_tick, self.icon_pending.items.len);
+        batch.ensureTotalCapacity(self.alloc, n) catch return;
+        for (self.icon_pending.items[0..n]) |nm| batch.appendAssumeCapacity(nm);
+        std.mem.copyForwards([]const u8, self.icon_pending.items[0 .. self.icon_pending.items.len - n], self.icon_pending.items[n..]);
+        self.icon_pending.items.len -= n;
+    }
+    for (batch.items) |name| {
+        const path = self.resolveIconPath(name);
+        var data = IconData{ .bytes = &.{}, .path = &.{} };
+        if (path) |p| {
+            if (!isRasterPath(p)) {
+                self.alloc.free(p);
+            } else if (self.readIconBytes(p)) |bytes| {
+                // Keep path for debugging; UI renders bytes.
+                data = .{ .bytes = bytes, .path = p };
+            } else {
+                self.alloc.free(p);
+            }
+        }
+        self.mu.lockUncancelable(self.io);
+        if (self.icon_cache.getPtr(name)) |ptr| {
+            if (ptr.* == null) {
+                ptr.* = data;
+            } else {
+                if (data.bytes.len > 0) self.alloc.free(data.bytes);
+                if (data.path.len > 0) self.alloc.free(data.path);
+            }
+        } else {
+            if (data.bytes.len > 0) self.alloc.free(data.bytes);
+            if (data.path.len > 0) self.alloc.free(data.path);
+        }
+        self.mu.unlock(self.io);
+    }
+}
+
 pub fn run(self: *Launcher, id: usize) void {
     if (id >= self.data.items.len) return;
     const app = self.data.items[id];
@@ -468,8 +817,15 @@ pub fn run(self: *Launcher, id: usize) void {
     const thread = std.Thread.spawn(.{}, struct {
         fn reap(b: *Box, alloc: std.mem.Allocator) void {
             defer alloc.destroy(b);
-            var status: c_int = 0;
-            _ = std.c.waitpid(b.pid, &status, 0);
+            // Raw syscall on Linux so headless tests stay libc-free (this
+            // toolchain cannot link libc); libc elsewhere.
+            if (builtin.os.tag == .linux) {
+                var status: u32 = 0;
+                _ = std.os.linux.waitpid(b.pid, &status, 0);
+            } else {
+                var status: c_int = 0;
+                _ = std.c.waitpid(b.pid, &status, 0);
+            }
         }
     }.reap, .{ box, self.alloc }) catch {
         self.alloc.destroy(box);
@@ -542,7 +898,7 @@ test "launcher: parser handles tricky real-world lines (equals in value, spaces)
         \\Exec=sh -c "echo a=b; echo c=d"
         \\Icon=myicon
         \\Type=Application
-        \\Comment=  spaced value  
+        \\Comment=  spaced value
         \\Categories=Utility;
         \\# Comment line
         \\GenericName=First
@@ -581,6 +937,136 @@ test "launcher: parser ignores actions and other groups" {
     try std.testing.expectEqual(@as(usize, 1), launcher.data.items.len);
     try std.testing.expectEqualStrings("App", launcher.data.items[0].name);
     try std.testing.expectEqualStrings("app", launcher.data.items[0].exec.?);
+}
+
+test "launcher: parser skips Hidden and NoDisplay entries" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var launcher: Launcher = .{};
+    launcher.init(alloc, io);
+    defer launcher.deinit();
+    const hidden_data =
+        \\[Desktop Entry]
+        \\Name=Secret
+        \\Exec=secret
+        \\Icon=secret
+        \\Type=Application
+        \\Hidden=true
+        \\
+    ;
+    try launcher.parseDesktopData(alloc, hidden_data, "/tmp/hidden.desktop");
+    const nodisplay_data =
+        \\[Desktop Entry]
+        \\Name=Backend
+        \\Exec=backend
+        \\Icon=backend
+        \\Type=Application
+        \\NoDisplay=True
+        \\
+    ;
+    try launcher.parseDesktopData(alloc, nodisplay_data, "/tmp/nodisplay.desktop");
+    const visible_data =
+        \\[Desktop Entry]
+        \\Name=Visible
+        \\Exec=visible
+        \\Icon=visible
+        \\Type=Application
+        \\Hidden=false
+        \\NoDisplay=0
+        \\
+    ;
+    try launcher.parseDesktopData(alloc, visible_data, "/tmp/visible.desktop");
+    try std.testing.expectEqual(@as(usize, 1), launcher.data.items.len);
+    try std.testing.expectEqualStrings("Visible", launcher.data.items[0].name);
+}
+
+test "launcher: icons resolve hicolor-first at 32px with cache" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var launcher: Launcher = .{};
+    launcher.init(alloc, io);
+    defer launcher.deinit();
+
+    // Miss enqueues, resolves after tickIcons.
+    try std.testing.expect(launcher.requestIcon("firefox") == null);
+    try launcher.tickIcons(8);
+    const hit = launcher.requestIcon("firefox");
+    try std.testing.expect(hit != null);
+    try std.testing.expect(hit.?.bytes.len > 0);
+    try std.testing.expect(std.mem.endsWith(u8, hit.?.path, ".png"));
+    // hicolor theme dir is honored first.
+    launcher.mu.lockUncancelable(io);
+    const first_theme = if (launcher.icon_theme_dirs.items.len > 0) launcher.icon_theme_dirs.items[0] else "";
+    launcher.mu.unlock(io);
+    try std.testing.expect(std.mem.endsWith(u8, first_theme, "/hicolor"));
+    // Second lookup is cached (no re-enqueue).
+    launcher.mu.lockUncancelable(io);
+    const pending_before = launcher.icon_pending.items.len;
+    launcher.mu.unlock(io);
+    _ = launcher.requestIcon("firefox");
+    launcher.mu.lockUncancelable(io);
+    const pending_after = launcher.icon_pending.items.len;
+    launcher.mu.unlock(io);
+    try std.testing.expectEqual(pending_before, pending_after);
+
+    // Missing names are negatively cached (empty data, still null to UI).
+    try std.testing.expect(launcher.requestIcon("zz-no-such-icon-xyz") == null);
+    try launcher.tickIcons(8);
+    const miss = launcher.requestIcon("zz-no-such-icon-xyz");
+    try std.testing.expect(miss != null and miss.?.bytes.len == 0);
+    launcher.mu.lockUncancelable(io);
+    const cached_miss = launcher.icon_cache.get("zz-no-such-icon-xyz");
+    launcher.mu.unlock(io);
+    try std.testing.expect(cached_miss != null and cached_miss.? != null);
+
+    // App helper returns an image source borrowing cache bytes.
+    var app = App{ .name = "Firefox", .icon = "firefox" };
+    // Point app.icon at the cached key so requestIcon hits the same entry.
+    launcher.mu.lockUncancelable(io);
+    var key_copy: []const u8 = "firefox";
+    var kit = launcher.icon_cache.iterator();
+    while (kit.next()) |kv| {
+        if (std.mem.eql(u8, kv.key_ptr.*, "firefox")) key_copy = kv.key_ptr.*;
+    }
+    launcher.mu.unlock(io);
+    app.icon = key_copy;
+    const src = app.iconImage(&launcher);
+    try std.testing.expect(src != null);
+    try std.testing.expect(app.iconTvg(&launcher) == null);
+}
+
+test "launcher: icons load ten quickly (perf probe)" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var launcher: Launcher = .{};
+    launcher.init(alloc, io);
+    defer launcher.deinit();
+    const names = [_][]const u8{ "firefox", "kmail", "sieveeditor", "akonadi", "akonadiconsole", "CMakeSetup", "firefox", "kmail", "sieveeditor", "zz-no-such-icon-xyz" };
+    for (names) |nm| {
+        const data = try std.fmt.allocPrint(alloc, "[Desktop Entry]\nName={s}\nExec={s}\nIcon={s}\nType=Application\n", .{ nm, nm, nm });
+        defer alloc.free(data);
+        try launcher.parseDesktopData(alloc, data, "/tmp/probe.desktop");
+    }
+    for (launcher.data.items) |*app| _ = launcher.requestIcon(app.icon);
+    const t0 = std.Io.Clock.boot.now(io);
+    var ticks: usize = 0;
+    while (ticks < 10) : (ticks += 1) {
+        launcher.mu.lockUncancelable(io);
+        const p = launcher.icon_pending.items.len;
+        launcher.mu.unlock(io);
+        if (p == 0) break;
+        try launcher.tickIcons(8);
+    }
+    const t1 = std.Io.Clock.boot.now(io);
+    const ms = @as(f64, @floatFromInt(t0.durationTo(t1).toNanoseconds())) / 1_000_000.0;
+    var hits: usize = 0;
+    for (launcher.data.items) |*app| {
+        const d = launcher.requestIcon(app.icon);
+        if (d != null and d.?.bytes.len > 0) hits += 1;
+    }
+    std.log.debug("icon probe: {d}/{d} hits in {d:.1}ms ({d} ticks)", .{ hits, names.len, ms, ticks });
+    try std.testing.expect(ticks <= 2);
+    try std.testing.expect(ms < 5000);
 }
 
 test "launcher: parse many real desktop files from system (practical)" {

@@ -38,7 +38,8 @@ const loop_sleep_ms: u64 = 25;
 // `requestCompositor` on its own connection. Mutations (switch/focus/close
 // and floating/tiling) are acked with `pong`; the outcome arrives later as
 // a broadcast push.
-const Action = union(enum) {
+// Pub so headless tests can inspect the queued requests.
+pub const Action = union(enum) {
     switch_workspace: u64,
     focus_window: u64,
     capture_window: CaptureWindow,
@@ -65,6 +66,7 @@ const Action = union(enum) {
 
 // Mutex-guarded queue. Push/pop take the mutex only for a few instructions,
 // never across network I/O. Items are owned: failed appends deinit the item.
+// Methods are pub so headless tests can drive/inspect the queues.
 fn Queue(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -72,7 +74,7 @@ fn Queue(comptime T: type) type {
         mu: std.Io.Mutex = .init,
         items: std.ArrayList(T) = .empty,
 
-        fn push(self: *Self, alloc: std.mem.Allocator, io: std.Io, v: T) void {
+        pub fn push(self: *Self, alloc: std.mem.Allocator, io: std.Io, v: T) void {
             self.mu.lockUncancelable(io);
             defer self.mu.unlock(io);
             self.items.append(alloc, v) catch {
@@ -81,7 +83,7 @@ fn Queue(comptime T: type) type {
             };
         }
 
-        fn popAll(self: *Self, io: std.Io, out: *std.ArrayList(T)) void {
+        pub fn popAll(self: *Self, io: std.Io, out: *std.ArrayList(T)) void {
             self.mu.lockUncancelable(io);
             defer self.mu.unlock(io);
             std.mem.swap(std.ArrayList(T), &self.items, out);
@@ -430,18 +432,25 @@ pub fn worker(self: *State, io: std.Io) void {
     var synced = false;
     var next_connect_ms: i64 = 0;
     while (!self.stop.load(.seq_cst)) {
-        // Launcher search: drain pending queue concurrently on this thread.
-        // Populated by UI via Launcher.search(); tick materializes results and
-        // wakes the GUI so the next frame sees them.
+        // Launcher search + icons: drain pending queues concurrently here.
+        // Populated by UI via Launcher.search()/requestIcon(); ticks
+        // materialize results and wake the GUI so the next frame sees them.
+        // Icons are time-sliced (8/tick) so a burst of misses never starves
+        // compositor IPC below.
         const had_pending = blk: {
             self.launcher.mu.lockUncancelable(self.io);
-            const n = self.launcher.pending.items.len;
+            const n = self.launcher.pending.items.len + self.launcher.icon_pending.items.len;
+            const built = self.launcher.icon_themes_built;
             self.launcher.mu.unlock(self.io);
-            break :blk n > 0;
+            // First icon tick also builds the theme index (one-time dir scan).
+            break :blk n > 0 or !built;
         };
         if (had_pending) {
             self.launcher.tick() catch |e| {
                 std.log.err("Launcher error {s}", .{@errorName(e)});
+            };
+            self.launcher.tickIcons(8) catch |e| {
+                std.log.err("Launcher icon error {s}", .{@errorName(e)});
             };
             self.requestRefresh();
         }

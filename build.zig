@@ -100,4 +100,41 @@ pub fn build(b: *std.Build) void {
     const test_launcher_step = b.step("test-launcher", "Run Launcher parser tests (no GUI)");
     test_launcher_step.dependOn(&run_launcher_tests.step);
     test_state_step.dependOn(&run_launcher_tests.step);
+
+    // Headless icon/search bench – link-light via dvui_shim (no GUI link).
+    const bench_module = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_module.addImport("dvui", dvui_shim);
+    const bench_exe = b.addExecutable(.{
+        .name = "bench-icons",
+        .root_module = bench_module,
+        .use_llvm = llvm,
+        .use_lld = lld,
+    });
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Run Launcher icon/search bench (no GUI)");
+    bench_step.dependOn(&run_bench.step);
+
+    // Headless HubUi logic tests (JSON scenarios in test/) – link-light via
+    // dvui_shim. Only HubUi's pure helpers are exercised (hubFrame itself is
+    // generic and never instantiated here, so no GUI link is needed).
+    const hub_ui_test_module = b.createModule(.{
+        .root_source_file = b.path("src/test_hub_ui.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    hub_ui_test_module.addImport("nilebank", nilebank_dep.module("nilebank"));
+    hub_ui_test_module.addImport("dvui", dvui_shim);
+    const hub_ui_tests = b.addTest(.{
+        .root_module = hub_ui_test_module,
+        .use_llvm = llvm,
+        .use_lld = lld,
+    });
+    const run_hub_ui_tests = b.addRunArtifact(hub_ui_tests);
+    const test_hub_ui_step = b.step("test-hub-ui", "Run HubUi logic tests (no GUI)");
+    test_hub_ui_step.dependOn(&run_hub_ui_tests.step);
+    test_state_step.dependOn(&run_hub_ui_tests.step);
 }
