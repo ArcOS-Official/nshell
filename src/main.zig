@@ -3,6 +3,7 @@ const dvui = @import("dvui");
 const ls = @import("layershell");
 const State = @import("State.zig");
 const HubUi = @import("HubUi.zig");
+const Icons = @import("Icons.zig");
 
 pub const panic = dvui.App.panic;
 pub const std_options: std.Options = .{ .logFn = dvui.App.logFn };
@@ -57,7 +58,6 @@ fn pumpEvents(backend_bar: anytype, win_bar: anytype, backend_hub: anytype, win_
             _ = try backend_bar.addEvent(win_bar, ev);
         }
     }
-
 }
 
 const LayerShellWindow = @typeInfo(@TypeOf(ls.initWindow)).@"fn".return_type.?;
@@ -150,7 +150,11 @@ pub fn main(init: std.process.Init) !u8 {
     var ref = io.async(struct {
         pub fn refresh(io_: std.Io) void {
             while (true) {
-                io_.sleep(.fromSeconds(1), .awake) catch {
+                // Fallback wakeup on the shared Net cadence: worker pushes
+                // already wake the loop on change, but snapshots also need
+                // to flow (and spinners/animations need frames) when
+                // nothing pushes. Matches HubUi's steady panel timer.
+                io_.sleep(.fromMilliseconds(@intCast(State.Net.refresh_ms)), .awake) catch {
                     return;
                 };
                 dvui.refresh(win_hub_g, @src(), null);
@@ -201,10 +205,22 @@ fn truncateTitle(s: []const u8, max: usize) []const u8 {
     return s[0 .. max - 1];
 }
 
+// The bar button only arms the toggle; HubUi.toggleNetworkMenu runs at
+// the top of the next hubFrame (hub window context) so the resize
+// animation registers on the right window. See HubUi.net_toggle_pending.
+fn toggleNetworkMenu() void {
+    hub_ui.net_toggle_pending = true;
+}
+
 fn frame() !dvui.App.Result {
     state.update();
 
     var t = &dvui.currentWindow().theme;
+
+    // Scale knob for the bar: workspace numbers set the type size, and icon
+    // glyphs render at the same size (see icon_px below).
+    const num_font = t.font_mono.withWeight(.bold).withSize(11.0);
+    const icon_px: f32 = num_font.size*2;
 
     var outer = dvui.box(@src(), .{ .dir = .horizontal }, .{
         .expand = .both,
@@ -258,7 +274,7 @@ fn frame() !dvui.App.Result {
                 .align_x = 0.5,
                 .align_y = 0.55,
             }, .{
-                .font = t.font_mono.withWeight(.bold).withSize(11.0),
+                .font = num_font,
                 .gravity_y = 0.5,
                 .gravity_x = 0.5,
                 .expand = .both,
@@ -287,6 +303,46 @@ fn frame() !dvui.App.Result {
             },
         );
         defer right.deinit();
+
+        const nst = state.net.status();
+        // One comptime call per icon (not a runtime-selected enum): tabler
+        // embeds only referenced icons, so the selection stays explicit.
+        // Aliased 1-bit raster (see Icons): rasterize at the display size,
+        // show 1:1 with nearest sampling.
+        const net_crisp: ?Icons.Crisp = if (nst.eth_up)
+            Icons.iconPx(.network, icon_px, .white) catch null
+        else if (nst.wifi_on)
+            Icons.iconPx(.wifi, icon_px, .white) catch null
+        else
+            Icons.iconPx(.wifi_off, icon_px, .white) catch null;
+
+        // Manual button composition (mirrors dvui.buttonIcon): the 32px box
+        // keeps the hit area, but the glyph renders at icon_px so it tracks
+        // the workspace number size instead of filling the button.
+        var nbtn: dvui.ButtonWidget = undefined;
+        nbtn.init(@src(), .{
+            .draw_focus = false,
+        }, .{
+            .color_fill = t.color(.content, .fill),
+            .corners = .all(10),
+            .padding = .all(0),
+            .min_size_content = .{ .w = 32, .h = 32 },
+            .max_size_content = .{ .w = 32, .h = 32 },
+            .gravity_y = 0.5,
+        });
+        defer nbtn.deinit();
+        nbtn.processEvents();
+        nbtn.drawBackground();
+        if (net_crisp) |c| {
+            _ = dvui.image(@src(), Icons.pixelImage(c), .{
+                .gravity_x = 0.5,
+                .gravity_y = 0.5,
+                .min_size_content = .{ .w = icon_px, .h = icon_px },
+                .expand = .none,
+            });
+        }
+        if (nbtn.clicked()) toggleNetworkMenu();
+        nbtn.drawFocus();
     }
 
     return .ok;

@@ -110,11 +110,12 @@ fn runCase(alloc: std.mem.Allocator, io: std.Io, c: Case) !void {
         } else if (std.mem.eql(u8, t, "switchMode")) {
             const mode = parseMode(obj.get("mode").?.string) orelse return error.BadMode;
             h.switchMode(mode, &state);
+        } else if (std.mem.eql(u8, t, "toggleNetwork")) {
+            h.toggleNetworkMenu(&state);
         } else if (std.mem.eql(u8, t, "render")) {
             // Frame-level mode redirects from hubFrame's render switch.
             switch (h.hubmode) {
                 .search => h.switchMode(.launcher, &state),
-                .wifi => h.switchMode(.clock, &state),
                 else => {},
             }
         } else if (std.mem.eql(u8, t, "advance")) {
@@ -139,6 +140,7 @@ fn runCase(alloc: std.mem.Allocator, io: std.Io, c: Case) !void {
             const consumed = switch (h.hubmode) {
                 .windows => h.handleWindowsKey(code, act, &state) or h.handleGlobalKey(code, act, shift, now, &state),
                 .launcher => h.handleLauncherKey(code, act, &state) or h.handleGlobalKey(code, act, shift, now, &state),
+                .network => h.handleNetworkKey(code, act, &state) or h.handleGlobalKey(code, act, shift, now, &state),
                 else => h.handleGlobalKey(code, act, shift, now, &state),
             };
             _ = consumed;
@@ -351,6 +353,224 @@ test "hub_ui: delayed switcher popup fires after 180ms" {
     _ = h.updateSwitcher(1200, &state);
     try testing.expectEqual(HubUi.HubMode.windows, h.hubmode);
     try testing.expect(!h.switcher_pending or h.hubmode == .windows);
+}
+
+test "hub_ui: toggleNetworkMenu flips mode and targets" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var state = State{};
+    state.socket_path_override = "/tmp/nshell-hubui-unused.sock";
+    try state.init(alloc, io);
+    defer state.deinit();
+
+    var h = HubUi.init();
+
+    h.toggleNetworkMenu(&state);
+    try testing.expectEqual(HubUi.HubMode.network, h.hubmode);
+    const open_ta = h.hub_target orelse return error.MissingTarget;
+    try testing.expectEqual(@as(f32, 520), open_ta.w);
+    try testing.expectEqual(@as(f32, 420), open_ta.h);
+
+    h.toggleNetworkMenu(&state);
+    try testing.expectEqual(HubUi.HubMode.clock, h.hubmode);
+    const shut_ta = h.hub_target orelse return error.MissingTarget;
+    try testing.expectEqual(@as(f32, 150), shut_ta.w);
+    try testing.expectEqual(@as(f32, 50), shut_ta.h);
+}
+
+test "hub_ui: network dismisses on focus loss edge" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var state = State{};
+    state.socket_path_override = "/tmp/nshell-hubui-unused.sock";
+    try state.init(alloc, io);
+    defer state.deinit();
+
+    var h = HubUi.init();
+    h.switchMode(.network, &state);
+    try testing.expectEqual(HubUi.HubMode.network, h.hubmode);
+
+    // Edge (prev focused, now not): dismisses back to clock.
+    h.hub_keyboard_focused = false;
+    _ = h.updateSwitcher(2000, &state);
+    try testing.expectEqual(HubUi.HubMode.clock, h.hubmode);
+    h.hub_prev_keyboard_focused = h.hub_keyboard_focused;
+
+    // Level (already unfocused, no new edge): a reopened panel stays.
+    h.switchMode(.network, &state);
+    _ = h.updateSwitcher(2100, &state);
+    try testing.expectEqual(HubUi.HubMode.network, h.hubmode);
+}
+
+test "hub_ui: entering clock pushes focus to head window" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var state = State{};
+    state.socket_path_override = "/tmp/nshell-hubui-unused.sock";
+    try state.init(alloc, io);
+    defer state.deinit();
+    try addWindows(&state, 2); // ids 100, 101; head is MRU
+
+    var h = HubUi.init();
+    h.hub_keyboard_focused = true;
+    h.switchMode(.network, &state);
+    h.switchMode(.clock, &state);
+
+    var batch: std.ArrayList(State.Action) = .empty;
+    defer batch.deinit(alloc);
+    state.req_q.popAll(io, &batch);
+    var focus_actions: usize = 0;
+    for (batch.items) |a| switch (a) {
+        .focus_window => |id| {
+            focus_actions += 1;
+            try testing.expectEqual(@as(u64, 100), id);
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 1), focus_actions);
+}
+
+test "hub_ui: clock entry pushes no focus when unfocused or empty" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var state = State{};
+    state.socket_path_override = "/tmp/nshell-hubui-unused.sock";
+    try state.init(alloc, io);
+    defer state.deinit();
+    try addWindows(&state, 1);
+
+    var h = HubUi.init();
+    // Hub doesn't hold focus: nothing to push away.
+    h.hub_keyboard_focused = false;
+    h.hub_prev_keyboard_focused = false;
+    h.switchMode(.network, &state);
+    h.switchMode(.clock, &state);
+
+    var batch: std.ArrayList(State.Action) = .empty;
+    defer batch.deinit(alloc);
+    state.req_q.popAll(io, &batch);
+    for (batch.items) |a| switch (a) {
+        .focus_window => return error.UnexpectedFocus,
+        else => {},
+    };
+}
+
+test "hub_ui: switcher commit suppresses the clock push" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var state = State{};
+    state.socket_path_override = "/tmp/nshell-hubui-unused.sock";
+    try state.init(alloc, io);
+    defer state.deinit();
+    try addWindows(&state, 3);
+
+    var h = HubUi.init();
+    h.hub_keyboard_focused = true;
+    h.selectIndex(&state, 1);
+    h.commitSwitcherSelection(&state); // focus_window 101
+    h.switchMode(.clock, &state); // must not override with head (100)
+
+    var batch: std.ArrayList(State.Action) = .empty;
+    defer batch.deinit(alloc);
+    state.req_q.popAll(io, &batch);
+    var focus_actions: usize = 0;
+    for (batch.items) |a| switch (a) {
+        .focus_window => |id| {
+            focus_actions += 1;
+            try testing.expectEqual(@as(u64, 101), id);
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 1), focus_actions);
+}
+
+test "hub_ui: connectToAp enqueues a tracked request" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var state = State{};
+    state.socket_path_override = "/tmp/nshell-hubui-unused.sock";
+    try state.init(alloc, io);
+    defer state.deinit();
+    try state.net.devices.append(alloc, .{
+        .path = try alloc.dupe(u8, "/dev/1"),
+        .iface = try alloc.dupe(u8, "wlan0"),
+        .kind = .wifi,
+        .state = 100,
+    });
+
+    var h = HubUi.init();
+    const ap = State.Net.ApView{
+        .id = 7,
+        .path = "/ap/1",
+        .ssid = "Home",
+        .strength = 80,
+        .secured = true,
+        .freq_mhz = 5180,
+        .active = false,
+    };
+    h.connectToAp(&state, "/dev/1", ap, "secret");
+    const req = h.net_req orelse return error.MissingRequest;
+    try testing.expect(req.isQueued());
+    try testing.expectEqual(@as(u64, 7), h.net_req_ap);
+}
+
+test "hub_ui: errFlashRed flashes twice then stops" {
+    // 10-frame periods (5 red, 5 transparent), twice.
+    for (0..5) |f| try testing.expect(HubUi.errFlashRed(@intCast(f)));
+    for (5..10) |f| try testing.expect(!HubUi.errFlashRed(@intCast(f)));
+    for (10..15) |f| try testing.expect(HubUi.errFlashRed(@intCast(f)));
+    for (15..20) |f| try testing.expect(!HubUi.errFlashRed(@intCast(f)));
+    // Then steady transparent.
+    try testing.expect(!HubUi.errFlashRed(20));
+    try testing.expect(!HubUi.errFlashRed(1000));
+}
+
+test "hub_ui: animFrac eases 0 to 1 on the shared clock" {
+    try testing.expectEqual(@as(f32, 0), HubUi.animFrac(1000, 1000));
+    const mid = HubUi.animFrac(1000, 1000 + 67);
+    try testing.expect(mid > 0 and mid < 1);
+    try testing.expectEqual(@as(f32, 1), HubUi.animFrac(1000, 1000 + HubUi.net_anim_ms));
+    try testing.expectEqual(@as(f32, 1), HubUi.animFrac(1000, 1000 + 10000));
+}
+
+test "hub_ui: netRowHeight animates on the hub curve" {
+    var h = HubUi.init();
+
+    // Idle: exact targets (shut = 32 header + 12 padding).
+    try testing.expectEqual(@as(f32, 44), h.netRowHeight(7, false, 1000));
+    try testing.expectEqual(@as(f32, 72), h.netRowHeight(7, true, 1000));
+
+    // Opening from shut: mid-flight strictly between, settled exact.
+    h.net_anim_open_ap = null;
+    h.net_anim_start = 1000;
+    const mid_open = h.netRowHeight(7, true, 1000 + 67);
+    try testing.expect(mid_open > 44 and mid_open < 72);
+    try testing.expectEqual(@as(f32, 72), h.netRowHeight(7, true, 1000 + HubUi.net_anim_ms));
+    try testing.expectEqual(@as(f32, 72), h.netRowHeight(7, true, 1000 + 10000));
+
+    // Closing from open; a shut row is untouched mid-flight, while a
+    // newly opened row animates up from shut on the same clock.
+    h.net_anim_open_ap = 7;
+    h.net_anim_start = 2000;
+    const mid_shut = h.netRowHeight(7, false, 2000 + 67);
+    try testing.expect(mid_shut > 44 and mid_shut < 72);
+    try testing.expectEqual(@as(f32, 44), h.netRowHeight(9, false, 2000 + 30));
+    const mid_open2 = h.netRowHeight(9, true, 2000 + 30);
+    try testing.expect(mid_open2 > 44 and mid_open2 < 72);
+    try testing.expectEqual(@as(f32, 72), h.netRowHeight(9, true, 2000 + 10000));
+}
+
+test "hub_ui: pressed sees no keys headless" {
+    // No frame events exist outside a live window; the scan must simply
+    // report false instead of failing to compile against the shim.
+    try testing.expect(!HubUi.pressed(.escape));
+    try testing.expect(!HubUi.pressed(.enter));
 }
 
 test "hub_ui: focus lost commits selection and resets" {

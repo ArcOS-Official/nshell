@@ -3,6 +3,7 @@ const dvui = @import("dvui");
 const nilebank = @import("nilebank");
 const proto = nilebank.protocols.compositor;
 const Launcher = @import("Launcher.zig");
+pub const Net = @import("Net.zig");
 
 const State = @This();
 
@@ -156,6 +157,8 @@ closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
 launcher: Launcher = .{},
 
+net: Net = .{},
+
 // Capture backoff (boot-ms timestamp; 0 = no backoff). The server may
 // answer capture_* with error code 3 when it can't serve a frame right now
 // ("capture not implemented" on old servers, or transient busy/not-ready on
@@ -218,6 +221,7 @@ pub fn initWithWakeup(
     self.wakeup_ctx = wakeup_ctx;
     self.wakeup_fn = wakeup_fn;
     self.launcher.init(alloc, io);
+    self.net.init(alloc, io);
     self.inited.store(true, .seq_cst);
 }
 
@@ -248,6 +252,7 @@ pub fn deinit(self: *State) void {
     defer self.commit_q.mu.unlock(self.io);
     self.commit_q.deinit(self.alloc);
     self.launcher.deinit();
+    self.net.deinit();
 }
 
 // UI -> worker: just enqueue; the worker sends on its own connection.
@@ -454,6 +459,11 @@ pub fn worker(self: *State, io: std.Io) void {
             };
             self.requestRefresh();
         }
+        const net_changed = self.net.tick() catch |e| blk: {
+            std.log.err("Net error {s}", .{@errorName(e)});
+            break :blk false;
+        };
+        if (net_changed) self.requestRefresh();
         const conn = self.ensureConn(io, &next_connect_ms) orelse {
             io.sleep(.fromMilliseconds(200), .awake) catch return;
             continue;

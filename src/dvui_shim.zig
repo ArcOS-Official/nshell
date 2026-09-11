@@ -65,6 +65,21 @@ pub const Id = struct {
 pub const Size = struct {
     w: f32 = 0,
     h: f32 = 0,
+
+    pub fn all(v: f32) Size {
+        return .{ .w = v, .h = v };
+    }
+};
+
+/// Minimal color stub: only what icon signatures name (`tint` params
+/// and `.white` defaults). Real rendering never runs headless.
+pub const Color = struct {
+    r: u8 = 255,
+    g: u8 = 255,
+    b: u8 = 255,
+    a: u8 = 255,
+
+    pub const white: Color = .{};
 };
 
 pub const enums = struct {
@@ -85,8 +100,33 @@ pub const App = struct {
     pub const Result = enum { ok };
 };
 
+/// Minimal event shapes for HubUi.pressed (frame-context key scan).
+/// Only the key surface is mirrored; real dvui carries far more.
+/// Headless tests never push events, so events() is always empty here.
+pub const Event = struct {
+    pub const Key = struct {
+        code: enums.Key = .escape,
+        action: Action = .up,
+
+        pub const Action = enum { down, repeat, up };
+    };
+
+    evt: union(enum) {
+        key: Key,
+    },
+};
+
+pub fn events() []const Event {
+    return &.{};
+}
+
 pub const easing = struct {
-    pub const outQuart: u8 = 0;
+    /// Real easing curve (mirrors dvui's outQuart = 1-(1-t)^4) so the
+    /// headless-tested row-height helper integrates against it.
+    pub fn outQuart(t: f32) f32 {
+        const u = 1 - t;
+        return 1 - u * u * u * u;
+    }
     pub const outExpo: u8 = 0;
 };
 

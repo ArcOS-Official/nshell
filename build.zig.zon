@@ -19,6 +19,10 @@
             .url = "git+https://github.com/ArcOS-Official/dvui_layershell.git#e7786b4959d1ab8076a0c6c35830a1e19e6a362f",
             .hash = "dvui_layer_shell-0.1.0-evhuWHj_AAAbEDorSQncjOarKOiWFVim42X0rV2ufZYx",
         },
+        .tabler_zig = .{
+            .url = "git+https://github.com/KernelState/tabler-zig.git#1c97e6517e0a0d26cbdf592b5d88bb2fde8e1634",
+            .hash = "tabler_zig-0.0.1-q88Ba3UWQABHwHsNnsjZ4q2_hwORdo24Yi5QfbEYpgzc",
+        },
     },
     .paths = .{
         "build.zig",
