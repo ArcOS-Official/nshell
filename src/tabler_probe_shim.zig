@@ -18,6 +18,10 @@ pub const Outline = enum {
     wifi_off,
     lock,
     lock_cancel,
+    bluetooth,
+    chevron_right,
+    chevron_left,
+    power,
 };
 
 pub const Filled = enum {

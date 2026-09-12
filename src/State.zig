@@ -9,7 +9,8 @@ const State = @This();
 
 // Namespace of the interactive hub layer surface (see main.zig initWindow).
 // Declared to the compositor via shell_register so it can focus this
-// surface on MOD press without nshell ever learning which key MOD is.
+// surface on MOD press without nshell ever learning which key MOD is,
+// and via request_keyboard_focus so opening a menu takes focus.
 pub const shell_namespace = "nshell-hub";
 
 // Request/response socket served by ../nile (`Bank.socket_id = "compositor"`).
@@ -48,6 +49,9 @@ pub const Action = union(enum) {
     set_window_floating: SetWindowFloating,
     set_workspace_mode: SetWorkspaceMode,
     set_focus_config: SetFocusConfig,
+    // Ask the compositor for keyboard focus on the hub layer surface
+    // (shell_namespace, filled in by the worker). No payload: plain data.
+    request_keyboard_focus: void,
 
     pub const CaptureWindow = struct {
         id: u64,
@@ -264,6 +268,13 @@ pub fn switchWorkspace(self: *State, id: u64) void {
 
 pub fn focusWindow(self: *State, id: u64) void {
     self.req_q.push(self.alloc, self.io, .{ .focus_window = id });
+}
+
+// Ask the compositor for keyboard focus on the hub layer surface (the
+// compositor grants it on request). Called when opening any menu from
+// clock mode so typing lands in the panel instead of the app beneath.
+pub fn requestHubFocus(self: *State) void {
+    self.req_q.push(self.alloc, self.io, .{ .request_keyboard_focus = {} });
 }
 
 // ---------------------------------------------------------------------------
@@ -713,6 +724,10 @@ fn handleAction(self: *State, conn: *nilebank.Connection, a: *Action) !void {
         },
         .set_focus_config => |v| {
             var ev = try conn.requestCompositor(.{ .set_focus_config = .{ .switch_workspace_on_focus = v.switch_workspace_on_focus } }, .raw);
+            defer ev.deinit(self.alloc);
+        },
+        .request_keyboard_focus => {
+            var ev = try conn.requestCompositor(.{ .request_keyboard_focus = .{ .namespace = shell_namespace } }, .raw);
             defer ev.deinit(self.alloc);
         },
     }

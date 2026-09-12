@@ -134,6 +134,44 @@ pub fn main(init: std.process.Init) !void {
             // (offset movement is visible without focus; the red stroke
             // needs entry_focused, verified in the live app instead).
         }
+        if (frames == 28) {
+            // Control center with the wifi/bluetooth toggles.
+            g_hub.switchMode(.controls, &g_state);
+        }
+        if (frames == 29) {
+            // Tap the bluetooth toggle: fade starts, the resize kicks
+            // off, the tab + back-button origin are recorded, but the
+            // mode stays controls until the fade midpoint.
+            g_hub.openNetworkFaded(&g_state, .bluetooth);
+        }
+        if (frames == 30) {
+            // Jump the fade clock past the midpoint so this frame takes
+            // the hubFrame commit path (live, the resize runs under the
+            // whole 180ms fade). Also publish two BT devices so the
+            // bluetooth tab renders rows, not the empty state.
+            g_hub.controls_fade_start = (g_hub.controls_fade_start orelse 0) -% 100;
+            const net = &g_state.net;
+            net.mu.lockUncancelable(io);
+            defer net.mu.unlock(io);
+            net.bt_present = true;
+            net.bt_powered = true;
+            net.bt_devices.append(alloc, .{
+                .name = try alloc.dupe(u8, "Headphones"),
+                .connected = true,
+                .paired = true,
+            }) catch {};
+            net.bt_devices.append(alloc, .{
+                .name = try alloc.dupe(u8, "Keyboard"),
+                .connected = false,
+                .paired = true,
+            }) catch {};
+        }
+        if (frames == 31) {
+            const ret_name: []const u8 = if (g_hub.net_return) |r| @tagName(r) else "none";
+            std.debug.print("fade: hubmode={s} tab={s} return={s}\n", .{
+                @tagName(g_hub.hubmode), @tagName(g_hub.net_tab), ret_name,
+            });
+        }
         _ = try frame();
         if (frames >= 20 and frames < 24) {
             std.debug.print("reject: since={d} ap={d} sel={?d} now={d}\n", .{

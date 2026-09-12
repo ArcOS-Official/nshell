@@ -379,6 +379,216 @@ test "hub_ui: toggleNetworkMenu flips mode and targets" {
     try testing.expectEqual(@as(f32, 50), shut_ta.h);
 }
 
+test "hub_ui: targetFor matches switchMode targets" {
+    try testing.expectEqual(dvui.Size{ .w = 600, .h = 120 }, HubUi.targetFor(.windows));
+    try testing.expectEqual(dvui.Size{ .w = 520, .h = 360 }, HubUi.targetFor(.launcher));
+    try testing.expectEqual(dvui.Size{ .w = 520, .h = 420 }, HubUi.targetFor(.network));
+    try testing.expectEqual(dvui.Size{ .w = 150, .h = 50 }, HubUi.targetFor(.clock));
+    try testing.expectEqual(dvui.Size{ .w = 520, .h = 360 }, HubUi.targetFor(.controls));
+}
+
+test "hub_ui: openNetworkFaded defers the mode commit" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var state = State{};
+    state.socket_path_override = "/tmp/nshell-hubui-unused.sock";
+    try state.init(alloc, io);
+    defer state.deinit();
+
+    var h = HubUi.init();
+    h.switchMode(.controls, &state);
+    try testing.expectEqual(HubUi.HubMode.controls, h.hubmode);
+
+    // From controls: resize kicks off but the mode stays until the
+    // hubFrame midpoint commit. The wifi toggle selects the wifi tab
+    // and records the controls origin for the back button.
+    h.openNetworkFaded(&state, .wifi);
+    try testing.expect(h.controls_fade_start != null);
+    try testing.expectEqual(HubUi.HubMode.controls, h.hubmode);
+    try testing.expectEqual(HubUi.NetTab.wifi, h.net_tab);
+    try testing.expectEqual(HubUi.HubMode.controls, h.net_return.?);
+    const ta = h.hub_target orelse return error.MissingTarget;
+    try testing.expectEqual(@as(f32, 520), ta.w);
+    try testing.expectEqual(@as(f32, 420), ta.h);
+
+    // Re-entry mid-fade converges at once: a second tap commits the
+    // open immediately instead of lingering in controls.
+    h.openNetworkFaded(&state, .bluetooth);
+    try testing.expectEqual(HubUi.HubMode.network, h.hubmode);
+    // ...but the tab hint still applies.
+    try testing.expectEqual(HubUi.NetTab.bluetooth, h.net_tab);
+
+    // Bar toggles are swallowed while a fade is in flight (the fade
+    // converges on open): fresh fade, then a toggle must not disturb it.
+    // (hubFrame clears controls_fade_start when the fade settles; headless
+    // there are no frames, so retire the previous fade by hand.)
+    h.controls_fade_start = null;
+    h.switchMode(.controls, &state);
+    h.openNetworkFaded(&state, null);
+    // Null tab keeps the current one.
+    try testing.expectEqual(HubUi.NetTab.bluetooth, h.net_tab);
+    h.toggleNetworkMenu(&state);
+    try testing.expectEqual(HubUi.HubMode.controls, h.hubmode);
+    try testing.expect(h.controls_fade_start != null);
+}
+
+test "hub_ui: openNetworkFaded outside controls switches at once" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var state = State{};
+    state.socket_path_override = "/tmp/nshell-hubui-unused.sock";
+    try state.init(alloc, io);
+    defer state.deinit();
+
+    var h = HubUi.init();
+    h.openNetworkFaded(&state, null);
+    try testing.expect(h.controls_fade_start == null);
+    try testing.expectEqual(HubUi.HubMode.network, h.hubmode);
+    // No tophub origin: no back button.
+    try testing.expect(h.net_return == null);
+}
+
+test "hub_ui: saturatingAge never underflows" {
+    try testing.expectEqual(@as(u64, 0), HubUi.saturatingAge(1000, 1000));
+    try testing.expectEqual(@as(u64, 499), HubUi.saturatingAge(1499, 1000));
+    // Fresh stamp newer than the frame clock (fade midpoint commit
+    // racing the millisecond): saturates instead of panicking.
+    try testing.expectEqual(@as(u64, 0), HubUi.saturatingAge(1000, 1001));
+    try testing.expectEqual(@as(u64, 0), HubUi.saturatingAge(0, std.math.maxInt(u64)));
+}
+
+test "hub_ui: opening a menu from clock requests hub focus" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var state = State{};
+    state.socket_path_override = "/tmp/nshell-hubui-unused.sock";
+    try state.init(alloc, io);
+    defer state.deinit();
+
+    const hubFocusRequests = struct {
+        fn count(s: *State, a: std.mem.Allocator, io_: std.Io) !usize {
+            var batch: std.ArrayList(State.Action) = .empty;
+            defer batch.deinit(a);
+            s.req_q.popAll(io_, &batch);
+            var n: usize = 0;
+            for (batch.items) |act| switch (act) {
+                .request_keyboard_focus => n += 1,
+                else => {},
+            };
+            return n;
+        }
+    }.count;
+
+    var h = HubUi.init();
+    h.switchMode(.launcher, &state);
+    try testing.expectEqual(@as(usize, 1), try hubFocusRequests(&state, alloc, io));
+    // Re-entering the same menu, moving between menus, or clock entry
+    // itself requests nothing further.
+    h.switchMode(.launcher, &state);
+    h.switchMode(.network, &state);
+    h.switchMode(.clock, &state);
+    try testing.expectEqual(@as(usize, 0), try hubFocusRequests(&state, alloc, io));
+}
+
+test "hub_ui: leaving network retires the back-button origin" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var state = State{};
+    state.socket_path_override = "/tmp/nshell-hubui-unused.sock";
+    try state.init(alloc, io);
+    defer state.deinit();
+
+    var h = HubUi.init();
+    h.switchMode(.controls, &state);
+    h.openNetworkFaded(&state, .bluetooth);
+    try testing.expectEqual(HubUi.HubMode.controls, h.net_return.?);
+    // The fade midpoint commit keeps the origin...
+    h.switchMode(.network, &state);
+    try testing.expectEqual(HubUi.HubMode.controls, h.net_return.?);
+    // ...leaving the panel clears it.
+    h.switchMode(.clock, &state);
+    try testing.expect(h.net_return == null);
+}
+
+test "hub_ui: focus loss always lands in clock mode" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var state = State{};
+    state.socket_path_override = "/tmp/nshell-hubui-unused.sock";
+    try state.init(alloc, io);
+    defer state.deinit();
+    try addWindows(&state, 1);
+
+    // From the launcher, even when another menu was last.
+    var h = HubUi.init();
+    h.switchMode(.launcher, &state);
+    h.last_hubmode = .network;
+    h.hub_keyboard_focused = false;
+    _ = h.updateSwitcher(2000, &state);
+    try testing.expectEqual(HubUi.HubMode.clock, h.hubmode);
+
+    // From the network panel: selection state is cleaned too.
+    h.switchMode(.network, &state);
+    h.net_sel = 7;
+    h.net_sel_open = true;
+    h.hub_keyboard_focused = true;
+    h.hub_prev_keyboard_focused = true;
+    h.hub_keyboard_focused = false;
+    _ = h.updateSwitcher(2100, &state);
+    try testing.expectEqual(HubUi.HubMode.clock, h.hubmode);
+    try testing.expect(h.net_sel == null);
+    try testing.expect(!h.net_sel_open);
+}
+
+test "hub_ui: network escape honors the tophub origin" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var state = State{};
+    state.socket_path_override = "/tmp/nshell-hubui-unused.sock";
+    try state.init(alloc, io);
+    defer state.deinit();
+
+    // Opened from the control center: Escape goes back to it.
+    var h = HubUi.init();
+    h.switchMode(.controls, &state);
+    h.openNetworkFaded(&state, .wifi);
+    h.switchMode(.network, &state); // fade midpoint commit
+    try testing.expect(h.handleNetworkKey(.escape, .down, &state));
+    try testing.expectEqual(HubUi.HubMode.controls, h.hubmode);
+    try testing.expect(h.net_return == null);
+
+    // Opened from the bar: Escape goes to clock.
+    h.switchMode(.network, &state);
+    try testing.expect(h.handleNetworkKey(.escape, .down, &state));
+    try testing.expectEqual(HubUi.HubMode.clock, h.hubmode);
+}
+
+test "hub_ui: aborting the fade cleans the transition" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var state = State{};
+    state.socket_path_override = "/tmp/nshell-hubui-unused.sock";
+    try state.init(alloc, io);
+    defer state.deinit();
+
+    var h = HubUi.init();
+    h.switchMode(.controls, &state);
+    h.openNetworkFaded(&state, .wifi);
+    try testing.expect(h.controls_fade_start != null);
+    // Focus loss mid-fade lands in clock with no stale transition.
+    h.hub_keyboard_focused = false;
+    _ = h.updateSwitcher(2000, &state);
+    try testing.expectEqual(HubUi.HubMode.clock, h.hubmode);
+    try testing.expect(h.controls_fade_start == null);
+}
+
 test "hub_ui: network dismisses on focus loss edge" {
     const alloc = testing.allocator;
     const io = testing.io;
