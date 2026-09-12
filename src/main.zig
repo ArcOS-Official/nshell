@@ -41,14 +41,6 @@ fn pumpEvents(backend_bar: anytype, win_bar: anytype, backend_hub: anytype, win_
             _ = try backend_hub.addEvent(win_hub, ev);
             continue;
         }
-        // dvui's SDL backend consumes FOCUS_GAINED/LOST for accesskit only
-        // and never surfaces them as dvui events, so track the hub's OS
-        // keyboard (input) focus ourselves for the switcher dismiss check.
-        if (ev.type == C.SDL_EVENT_WINDOW_FOCUS_GAINED or ev.type == C.SDL_EVENT_WINDOW_FOCUS_LOST) {
-            if (C.SDL_GetWindowFromEvent(&ev) == backend_hub.window) {
-                hub_ui.hub_keyboard_focused = ev.type == C.SDL_EVENT_WINDOW_FOCUS_GAINED;
-            }
-        }
         const t_ = C.SDL_GetWindowFromEvent(&ev);
         if (t_ == null or t_ == backend_bar.window) {
             _ = try backend_bar.addEvent(win_bar, ev);
@@ -59,6 +51,15 @@ fn pumpEvents(backend_bar: anytype, win_bar: anytype, backend_hub: anytype, win_
         }
     }
 }
+
+// Authoritative hub keyboard (input) focus now comes from the compositor:
+// nile broadcasts `shell_focus_changed` on every focus edge (plus once
+// after each `shell_register` so reconnects converge), and State's worker
+// thread stores it straight into HubUi.hub_keyboard_focused via the
+// bindHubFocus pointer below. No SDL polling here: dvui's SDL backend
+// consumes FOCUS_GAINED/LOST for accesskit and never surfaces them as
+// dvui events, and the window flag can race the compositor (focus granted
+// after a panel-open request arrives a frame later, reading as a loss).
 
 const LayerShellWindow = @typeInfo(@TypeOf(ls.initWindow)).@"fn".return_type.?;
 
@@ -139,6 +140,9 @@ pub fn main(init: std.process.Init) !u8 {
 
     try state.initWithWakeup(gpa, io, &win_bar, &requestDvuiRefresh);
     defer state.deinit();
+    // Worker-driven focus: compositor pushes store straight into the hub
+    // flag (see State.bindHubFocus). Must precede the worker spawn below.
+    state.bindHubFocus(&hub_ui.hub_keyboard_focused);
     // Populate launcher list (uses arena alloc, non-fatal if dirs missing).
     state.launcher.loadList(init) catch |e| std.log.warn("launcher load: {s}", .{@errorName(e)});
 

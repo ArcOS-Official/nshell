@@ -225,6 +225,33 @@ pub fn build(b: *std.Build) void {
     const probe_step = b.step("layout-probe", "Dump network panel geometry headlessly (no GUI)");
     probe_step.dependOn(&run_probe.step);
 
+    // Headless media-player layout probe (src/media_probe.zig): same
+    // harness as layout-probe, but injects a playing MPRIS track and dumps
+    // the expanded clock + control-center card geometry.
+    const media_probe_module = b.createModule(.{
+        .root_source_file = b.path("src/media_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    media_probe_module.linkSystemLibrary("systemd", .{ .use_pkg_config = .no });
+    media_probe_module.addCSourceFile(.{
+        .file = dvui_custom_dep.path("vendor/stb/stb_image_impl.c"),
+    });
+    media_probe_module.addImport("dvui", dvui_custom_mod);
+    media_probe_module.addImport("sd_bus", sd_bus_mod);
+    media_probe_module.addImport("tabler", probe_tabler_mod);
+    media_probe_module.addImport("nilebank", nilebank_dep.module("nilebank"));
+    const media_probe_exe = b.addExecutable(.{
+        .name = "media-probe",
+        .root_module = media_probe_module,
+        .use_llvm = llvm,
+        .use_lld = lld,
+    });
+    const run_media_probe = b.addRunArtifact(media_probe_exe);
+    const media_probe_step = b.step("media-probe", "Dump clock media player geometry headlessly (no GUI)");
+    media_probe_step.dependOn(&run_media_probe.step);
+
     // Headless HubUi logic tests (JSON scenarios in test/) – link-light via
     // dvui_shim. Only HubUi's pure helpers are exercised (hubFrame itself is
     // generic and never instantiated here, so no GUI link is needed).
@@ -274,6 +301,25 @@ pub fn build(b: *std.Build) void {
     const test_net_step = b.step("test-net", "Run Net unit tests (no GUI, no bus)");
     test_net_step.dependOn(&run_net_tests.step);
     test_state_step.dependOn(&run_net_tests.step);
+
+    // Media unit tests (src/Media.zig). Same shape as Net: needs the sd_bus
+    // import via Dbus.zig, stubbed in test builds, so no live session bus
+    // is required.
+    const media_test_module = b.createModule(.{
+        .root_source_file = b.path("src/Media.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    media_test_module.addImport("sd_bus", sd_bus_mod);
+    const media_tests = b.addTest(.{
+        .root_module = media_test_module,
+        .use_llvm = llvm,
+        .use_lld = lld,
+    });
+    const run_media_tests = b.addRunArtifact(media_tests);
+    const test_media_step = b.step("test-media", "Run Media unit tests (no GUI, no bus)");
+    test_media_step.dependOn(&run_media_tests.step);
+    test_state_step.dependOn(&run_media_tests.step);
 
     // Aliased-icon helper tests (src/Icons.zig). Only the pure threshold
     // helper is exercised: iconPx needs a window, which the headless

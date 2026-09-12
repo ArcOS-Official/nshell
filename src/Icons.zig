@@ -44,8 +44,15 @@ pub fn thresholdAlpha(rgba: []u8, cutoff: u8) void {
 // window under `nshell-crisp-outline-<tag>-WxH-<tint>` (same data-store
 // pattern `tabler` itself uses: the store copies, so the arena scratch
 // below is safe to hand over). Repeat calls are free after the first.
+//
+// `raster_px` is the LOGICAL display size: the raster is generated at
+// raster_px * windowNaturalScale() so one raster pixel maps to one
+// physical pixel. Displayed 1:1 with nearest sampling that keeps hard
+// single-physical-pixel edges; rasterizing at the logical size instead
+// would nearest-upscale on any hidpi display (chunky double pixels).
 pub fn iconPx(comptime icon: tabler.Outline, raster_px: f32, tint: dvui.Color) !Crisp {
-    const r = try tabler.outlineRaster(icon, dvui.Size.all(raster_px), tint);
+    const px = raster_px * dvui.windowNaturalScale();
+    const r = try tabler.outlineRaster(icon, dvui.Size.all(px), tint);
     if (r.rgba.len == 0) return .{ .rgba = &.{}, .w = r.w, .h = r.h };
 
     const rgba = tint.toRGBA();
@@ -72,8 +79,10 @@ pub fn iconPx(comptime icon: tabler.Outline, raster_px: f32, tint: dvui.Color) !
 // window under `nshell-crisp-outline-<tag>-WxH-<tint>` (same data-store
 // pattern `tabler` itself uses: the store copies, so the arena scratch
 // below is safe to hand over). Repeat calls are free after the first.
+// See iconPx for the logical-size / natural-scale contract.
 pub fn iconPxFilled(comptime icon: tabler.Filled, raster_px: f32, tint: dvui.Color) !Crisp {
-    const r = try tabler.filledRaster(icon, dvui.Size.all(raster_px), tint);
+    const px = raster_px * dvui.windowNaturalScale();
+    const r = try tabler.filledRaster(icon, dvui.Size.all(px), tint);
     if (r.rgba.len == 0) return .{ .rgba = &.{}, .w = r.w, .h = r.h };
 
     const rgba = tint.toRGBA();

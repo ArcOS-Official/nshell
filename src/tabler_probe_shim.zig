@@ -22,6 +22,11 @@ pub const Outline = enum {
     chevron_right,
     chevron_left,
     power,
+    music,
+    player_play,
+    player_pause,
+    player_skip_back,
+    player_skip_forward,
 };
 
 pub const Filled = enum {

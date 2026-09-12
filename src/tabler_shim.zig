@@ -24,6 +24,11 @@ pub const Outline = enum {
     wifi_off,
     lock,
     lock_cancel,
+    music,
+    player_play,
+    player_pause,
+    player_skip_back,
+    player_skip_forward,
 };
 
 pub fn outline(comptime icon: Outline, size: dvui.Size) ![]const u8 {

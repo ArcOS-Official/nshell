@@ -97,7 +97,7 @@ fn runCase(alloc: std.mem.Allocator, io: std.Io, c: Case) !void {
     try addWindows(&state, c.windows_count);
 
     var h = HubUi.init();
-    h.hub_keyboard_focused = c.hub_keyboard_focused;
+    h.hub_keyboard_focused.store(c.hub_keyboard_focused, .seq_cst);
     h.hub_prev_keyboard_focused = c.hub_keyboard_focused;
 
     var now: u64 = 1000;
@@ -121,16 +121,17 @@ fn runCase(alloc: std.mem.Allocator, io: std.Io, c: Case) !void {
         } else if (std.mem.eql(u8, t, "advance")) {
             now += @intCast(obj.get("ms").?.integer);
             _ = h.updateSwitcher(now, &state);
-            h.hub_prev_keyboard_focused = h.hub_keyboard_focused;
+            h.hub_prev_keyboard_focused = h.hub_keyboard_focused.load(.seq_cst);
         } else if (std.mem.eql(u8, t, "hover")) {
             h.hub_was_hovered = obj.get("hovered").?.bool;
         } else if (std.mem.eql(u8, t, "type")) {
             h.launcher_query = obj.get("text").?.string;
         } else if (std.mem.eql(u8, t, "focus")) {
-            // Simulate an OS focus change on the hub surface (pumpEvents
-            // writes this in production). updateSwitcher (called at the
-            // next step boundary, mirroring hubFrame) sees the transition.
-            h.hub_keyboard_focused = obj.get("focused").?.bool;
+            // Simulate a compositor focus push on the hub surface (the
+            // worker stores this in production). updateSwitcher (called at
+            // the next step boundary, mirroring hubFrame) sees the
+            // transition.
+            h.hub_keyboard_focused.store(obj.get("focused").?.bool, .seq_cst);
         } else if (std.mem.eql(u8, t, "key")) {
             const code = parseKey(obj.get("code").?.string) orelse return error.BadKey;
             const act_str = obj.get("action").?.string;
@@ -151,7 +152,7 @@ fn runCase(alloc: std.mem.Allocator, io: std.Io, c: Case) !void {
             now += 50;
             _ = h.updateSwitcher(now, &state);
             // hubFrame defers this at frame end: prev tracks the last frame.
-            h.hub_prev_keyboard_focused = h.hub_keyboard_focused;
+            h.hub_prev_keyboard_focused = h.hub_keyboard_focused.load(.seq_cst);
         } else {
             std.debug.print("case '{s}' ({s}): unknown input type '{s}'\n", .{ c.name, c.file, t });
             return error.BadInputType;
@@ -173,7 +174,7 @@ fn runCase(alloc: std.mem.Allocator, io: std.Io, c: Case) !void {
     if (c.exp_launch_need_focus) |lf| try ctx.chk("launcher_need_focus", c, lf == h.launcher_need_focus);
     if (c.exp_windows_need_focus) |wf| try ctx.chk("windows_need_focus", c, wf == h.windows_need_focus);
     if (c.exp_last_hubmode) |lm| try ctx.chk("last_hubmode", c, lm == h.last_hubmode);
-    if (c.exp_kb_focused) |kf| try ctx.chk("hub_keyboard_focused", c, kf == h.hub_keyboard_focused);
+    if (c.exp_kb_focused) |kf| try ctx.chk("hub_keyboard_focused", c, kf == h.hub_keyboard_focused.load(.seq_cst));
     if (c.exp_hub_target) |want| {
         if (h.hub_target) |got| {
             try ctx.chk("hub_target.w", c, want.w == got.w);
@@ -384,7 +385,22 @@ test "hub_ui: targetFor matches switchMode targets" {
     try testing.expectEqual(dvui.Size{ .w = 520, .h = 360 }, HubUi.targetFor(.launcher));
     try testing.expectEqual(dvui.Size{ .w = 520, .h = 420 }, HubUi.targetFor(.network));
     try testing.expectEqual(dvui.Size{ .w = 150, .h = 50 }, HubUi.targetFor(.clock));
-    try testing.expectEqual(dvui.Size{ .w = 520, .h = 360 }, HubUi.targetFor(.controls));
+    try testing.expectEqual(dvui.Size{ .w = 520, .h = 412 }, HubUi.targetFor(.controls));
+}
+
+test "hub_ui: media expands clock and control center, others override" {
+    // Idle sizes stay exactly as before (no player).
+    try testing.expectEqual(dvui.Size{ .w = 150, .h = 50 }, HubUi.targetForMedia(.clock, false));
+    // Active player: 132 clock + 26 glyph + 160 capped title + 84 buttons
+    // (= 402) plus the 12-unit row padding on each edge and outer chrome.
+    // Height never changes.
+    try testing.expectEqual(dvui.Size{ .w = 444, .h = 50 }, HubUi.targetForMedia(.clock, true));
+    // Control center always carries the attached clock header.
+    try testing.expectEqual(dvui.Size{ .w = 520, .h = 412 }, HubUi.targetForMedia(.controls, false));
+    try testing.expectEqual(dvui.Size{ .w = 520, .h = 412 }, HubUi.targetForMedia(.controls, true));
+    // Sub-panels override entirely: no clock content there.
+    try testing.expectEqual(dvui.Size{ .w = 520, .h = 420 }, HubUi.targetForMedia(.network, true));
+    try testing.expectEqual(dvui.Size{ .w = 600, .h = 120 }, HubUi.targetForMedia(.windows, true));
 }
 
 test "hub_ui: openNetworkFaded defers the mode commit" {
@@ -407,7 +423,7 @@ test "hub_ui: openNetworkFaded defers the mode commit" {
     try testing.expect(h.controls_fade_start != null);
     try testing.expectEqual(HubUi.HubMode.controls, h.hubmode);
     try testing.expectEqual(HubUi.NetTab.wifi, h.net_tab);
-    try testing.expectEqual(HubUi.HubMode.controls, h.net_return.?);
+    try testing.expectEqual(HubUi.HubMode.controls, h.menu_origin.?);
     const ta = h.hub_target orelse return error.MissingTarget;
     try testing.expectEqual(@as(f32, 520), ta.w);
     try testing.expectEqual(@as(f32, 420), ta.h);
@@ -447,7 +463,7 @@ test "hub_ui: openNetworkFaded outside controls switches at once" {
     try testing.expect(h.controls_fade_start == null);
     try testing.expectEqual(HubUi.HubMode.network, h.hubmode);
     // No tophub origin: no back button.
-    try testing.expect(h.net_return == null);
+    try testing.expect(h.menu_origin == null);
 }
 
 test "hub_ui: saturatingAge never underflows" {
@@ -505,16 +521,16 @@ test "hub_ui: leaving network retires the back-button origin" {
     var h = HubUi.init();
     h.switchMode(.controls, &state);
     h.openNetworkFaded(&state, .bluetooth);
-    try testing.expectEqual(HubUi.HubMode.controls, h.net_return.?);
+    try testing.expectEqual(HubUi.HubMode.controls, h.menu_origin.?);
     // The fade midpoint commit keeps the origin...
     h.switchMode(.network, &state);
-    try testing.expectEqual(HubUi.HubMode.controls, h.net_return.?);
+    try testing.expectEqual(HubUi.HubMode.controls, h.menu_origin.?);
     // ...leaving the panel clears it.
     h.switchMode(.clock, &state);
-    try testing.expect(h.net_return == null);
+    try testing.expect(h.menu_origin == null);
 }
 
-test "hub_ui: focus loss always lands in clock mode" {
+test "hub_ui: focus loss always lands in clock mode, from every mode" {
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -524,28 +540,40 @@ test "hub_ui: focus loss always lands in clock mode" {
     defer state.deinit();
     try addWindows(&state, 1);
 
-    // From the launcher, even when another menu was last.
+    // From the launcher (direct member), even when another menu was last.
     var h = HubUi.init();
     h.switchMode(.launcher, &state);
     h.last_hubmode = .network;
-    h.hub_keyboard_focused = false;
+    h.hub_keyboard_focused.store(false, .seq_cst);
     _ = h.updateSwitcher(2000, &state);
     try testing.expectEqual(HubUi.HubMode.clock, h.hubmode);
 
-    // From the network panel: selection state is cleaned too.
-    h.switchMode(.network, &state);
+    // From a controls child (network with origin): still clock — the
+    // back button is the only path back to the control center.
+    h.switchMode(.controls, &state);
+    h.openNetworkFaded(&state, .wifi);
+    h.switchMode(.network, &state); // fade midpoint commit
     h.net_sel = 7;
     h.net_sel_open = true;
-    h.hub_keyboard_focused = true;
+    h.hub_keyboard_focused.store(true, .seq_cst);
     h.hub_prev_keyboard_focused = true;
-    h.hub_keyboard_focused = false;
+    h.hub_keyboard_focused.store(false, .seq_cst);
     _ = h.updateSwitcher(2100, &state);
     try testing.expectEqual(HubUi.HubMode.clock, h.hubmode);
     try testing.expect(h.net_sel == null);
     try testing.expect(!h.net_sel_open);
+    try testing.expect(h.menu_origin == null);
+
+    // From the control center itself: clock as well.
+    h.switchMode(.controls, &state);
+    h.hub_keyboard_focused.store(true, .seq_cst);
+    h.hub_prev_keyboard_focused = true;
+    h.hub_keyboard_focused.store(false, .seq_cst);
+    _ = h.updateSwitcher(2200, &state);
+    try testing.expectEqual(HubUi.HubMode.clock, h.hubmode);
 }
 
-test "hub_ui: network escape honors the tophub origin" {
+test "hub_ui: network escape always lands in clock" {
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -554,19 +582,68 @@ test "hub_ui: network escape honors the tophub origin" {
     try state.init(alloc, io);
     defer state.deinit();
 
-    // Opened from the control center: Escape goes back to it.
+    // Opened from the control center: Escape still goes to clock (the
+    // back button is the only path back to the control center).
     var h = HubUi.init();
     h.switchMode(.controls, &state);
     h.openNetworkFaded(&state, .wifi);
     h.switchMode(.network, &state); // fade midpoint commit
     try testing.expect(h.handleNetworkKey(.escape, .down, &state));
-    try testing.expectEqual(HubUi.HubMode.controls, h.hubmode);
-    try testing.expect(h.net_return == null);
+    try testing.expectEqual(HubUi.HubMode.clock, h.hubmode);
+    try testing.expect(h.menu_origin == null);
 
-    // Opened from the bar: Escape goes to clock.
+    // Opened from the bar (via clock, like a real direct open): Escape
+    // goes to clock.
+    h.switchMode(.clock, &state);
     h.switchMode(.network, &state);
+    try testing.expect(h.menu_origin == null);
     try testing.expect(h.handleNetworkKey(.escape, .down, &state));
     try testing.expectEqual(HubUi.HubMode.clock, h.hubmode);
+
+    // Grandchild: launcher opened during a controls session escapes
+    // to clock too.
+    h.switchMode(.controls, &state);
+    h.openNetworkFaded(&state, .wifi);
+    h.switchMode(.network, &state);
+    h.switchMode(.launcher, &state);
+    try testing.expect(h.handleLauncherKey(.escape, .down, &state));
+    try testing.expectEqual(HubUi.HubMode.clock, h.hubmode);
+}
+
+test "hub_ui: back button close fades to the control center" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var state = State{};
+    state.socket_path_override = "/tmp/nshell-hubui-unused.sock";
+    try state.init(alloc, io);
+    defer state.deinit();
+
+    // Settled controls-child network (hubFrame clears the fade after
+    // 180ms): the back path arms the close fade — network renders
+    // fading out, controls commits at the midpoint.
+    var h = HubUi.init();
+    h.switchMode(.controls, &state);
+    h.openNetworkFaded(&state, .wifi);
+    h.switchMode(.network, &state); // fade midpoint commit
+    h.controls_fade_start = null; // settled
+    h.closeNetworkFaded(&state);
+    try testing.expect(h.controls_fade_start != null);
+    try testing.expect(h.fade_to_controls);
+    try testing.expectEqual(HubUi.HubMode.network, h.hubmode); // still fading out
+    h.switchMode(.controls, &state); // fade midpoint commit
+    try testing.expectEqual(HubUi.HubMode.controls, h.hubmode);
+    try testing.expect(h.menu_origin == null);
+
+    // Escape mid-close-fade converges at once instead of stacking a
+    // second transition.
+    h.openNetworkFaded(&state, .wifi);
+    h.switchMode(.network, &state);
+    h.controls_fade_start = null; // settled
+    h.closeNetworkFaded(&state);
+    try testing.expect(h.handleNetworkKey(.escape, .down, &state));
+    try testing.expectEqual(HubUi.HubMode.clock, h.hubmode);
+    try testing.expect(h.controls_fade_start == null);
 }
 
 test "hub_ui: aborting the fade cleans the transition" {
@@ -582,8 +659,9 @@ test "hub_ui: aborting the fade cleans the transition" {
     h.switchMode(.controls, &state);
     h.openNetworkFaded(&state, .wifi);
     try testing.expect(h.controls_fade_start != null);
-    // Focus loss mid-fade lands in clock with no stale transition.
-    h.hub_keyboard_focused = false;
+    // Focus loss mid-fade dismisses to clock like any other dismissal,
+    // with no stale transition.
+    h.hub_keyboard_focused.store(false, .seq_cst);
     _ = h.updateSwitcher(2000, &state);
     try testing.expectEqual(HubUi.HubMode.clock, h.hubmode);
     try testing.expect(h.controls_fade_start == null);
@@ -603,10 +681,10 @@ test "hub_ui: network dismisses on focus loss edge" {
     try testing.expectEqual(HubUi.HubMode.network, h.hubmode);
 
     // Edge (prev focused, now not): dismisses back to clock.
-    h.hub_keyboard_focused = false;
+    h.hub_keyboard_focused.store(false, .seq_cst);
     _ = h.updateSwitcher(2000, &state);
     try testing.expectEqual(HubUi.HubMode.clock, h.hubmode);
-    h.hub_prev_keyboard_focused = h.hub_keyboard_focused;
+    h.hub_prev_keyboard_focused = h.hub_keyboard_focused.load(.seq_cst);
 
     // Level (already unfocused, no new edge): a reopened panel stays.
     h.switchMode(.network, &state);
@@ -625,7 +703,7 @@ test "hub_ui: entering clock pushes focus to head window" {
     try addWindows(&state, 2); // ids 100, 101; head is MRU
 
     var h = HubUi.init();
-    h.hub_keyboard_focused = true;
+    h.hub_keyboard_focused.store(true, .seq_cst);
     h.switchMode(.network, &state);
     h.switchMode(.clock, &state);
 
@@ -655,7 +733,7 @@ test "hub_ui: clock entry pushes no focus when unfocused or empty" {
 
     var h = HubUi.init();
     // Hub doesn't hold focus: nothing to push away.
-    h.hub_keyboard_focused = false;
+    h.hub_keyboard_focused.store(false, .seq_cst);
     h.hub_prev_keyboard_focused = false;
     h.switchMode(.network, &state);
     h.switchMode(.clock, &state);
@@ -680,7 +758,7 @@ test "hub_ui: switcher commit suppresses the clock push" {
     try addWindows(&state, 3);
 
     var h = HubUi.init();
-    h.hub_keyboard_focused = true;
+    h.hub_keyboard_focused.store(true, .seq_cst);
     h.selectIndex(&state, 1);
     h.commitSwitcherSelection(&state); // focus_window 101
     h.switchMode(.clock, &state); // must not override with head (100)
@@ -783,6 +861,30 @@ test "hub_ui: pressed sees no keys headless" {
     try testing.expect(!HubUi.pressed(.enter));
 }
 
+test "hub_ui: worker-stored focus edge dismisses via updateSwitcher" {
+    // setHubFocused simulates the worker thread's `shell_focus_changed`
+    // store; the UI thread observes it through hubFocused() with no
+    // extra sync, and updateSwitcher fires the dismissal edge.
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var state = State{};
+    state.socket_path_override = "/tmp/nshell-hubui-unused.sock";
+    try state.init(alloc, io);
+    defer state.deinit();
+    try addWindows(&state, 1);
+
+    var h = HubUi.init();
+    try testing.expect(h.hubFocused());
+    h.switchMode(.launcher, &state);
+    // Bind like main.zig does, then flip from the "worker" side.
+    state.bindHubFocus(&h.hub_keyboard_focused);
+    h.setHubFocused(false);
+    try testing.expect(!h.hubFocused());
+    _ = h.updateSwitcher(2000, &state);
+    try testing.expectEqual(HubUi.HubMode.clock, h.hubmode);
+}
+
 test "hub_ui: focus lost commits selection and resets" {
     const alloc = testing.allocator;
     const io = testing.io;
@@ -796,7 +898,7 @@ test "hub_ui: focus lost commits selection and resets" {
     var h = HubUi.init();
 
     _ = h.handleGlobalKey(.tab, .down, false, 1000, &state);
-    h.hub_keyboard_focused = false; // MOD released
+    h.hub_keyboard_focused.store(false, .seq_cst); // MOD released
     _ = h.updateSwitcher(1050, &state);
     try testing.expectEqual(HubUi.HubMode.clock, h.hubmode);
     try testing.expect(!h.switcher_pending);

@@ -22,6 +22,15 @@ pub fn openSystem() ?*Bus {
     return bus;
 }
 
+/// Session (user) bus: MPRIS players live here, not on the system bus.
+/// Mirrors openSystem; null in headless tests so Media ticks harmlessly.
+pub fn openSession() ?*Bus {
+    if (testing) return null;
+    var bus: ?*Bus = null;
+    if (c.sd_bus_open_user(&bus) < 0) return null;
+    return bus;
+}
+
 pub fn closeBus(bus: ?*Bus) void {
     if (testing) return;
     _ = c.sd_bus_unref(bus);
@@ -213,6 +222,20 @@ pub const Reply = struct {
         if (testing) return null;
         var v: u8 = 0;
         if (c.sd_bus_message_read_basic(self.m, 'y', &v) <= 0) return null;
+        return v;
+    }
+
+    pub fn readI64(self: *Reply) ?i64 {
+        if (testing) return null;
+        var v: i64 = 0;
+        if (c.sd_bus_message_read_basic(self.m, 'x', &v) <= 0) return null;
+        return v;
+    }
+
+    pub fn readI32(self: *Reply) ?i32 {
+        if (testing) return null;
+        var v: i32 = 0;
+        if (c.sd_bus_message_read_basic(self.m, 'i', &v) <= 0) return null;
         return v;
     }
 

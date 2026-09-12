@@ -167,7 +167,7 @@ pub fn main(init: std.process.Init) !void {
             }) catch {};
         }
         if (frames == 31) {
-            const ret_name: []const u8 = if (g_hub.net_return) |r| @tagName(r) else "none";
+            const ret_name: []const u8 = if (g_hub.menu_origin) |r| @tagName(r) else "none";
             std.debug.print("fade: hubmode={s} tab={s} return={s}\n", .{
                 @tagName(g_hub.hubmode), @tagName(g_hub.net_tab), ret_name,
             });

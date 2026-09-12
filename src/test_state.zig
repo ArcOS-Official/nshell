@@ -171,6 +171,38 @@ test "state: query, broadcast override, actions, images via 2-way connection" {
     }
     try t.expectEqual(@as(usize, 1), state.windows.len);
 
+    // Compositor-driven hub focus: the worker stores `shell_focus_changed`
+    // pushes straight into the bound HubUi flag (no commit-queue round
+    // trip), so the UI thread observes the edge on its next frame.
+    {
+        var hub_focused = std.atomic.Value(bool).init(true);
+        state.bindHubFocus(&hub_focused);
+        {
+            var ev: proto.Event = .{ .shell_focus_changed = .{ .focused = false } };
+            defer ev.deinit(alloc);
+            try server.broadcastCompositorEventDefault(ev);
+        }
+        tries = 0;
+        while (hub_focused.load(.seq_cst) and tries < 500) : (tries += 1) {
+            io.sleep(.fromMilliseconds(10), .awake) catch {};
+        }
+        try t.expect(!hub_focused.load(.seq_cst));
+        {
+            var ev: proto.Event = .{ .shell_focus_changed = .{ .focused = true } };
+            defer ev.deinit(alloc);
+            try server.broadcastCompositorEventDefault(ev);
+        }
+        tries = 0;
+        while (!hub_focused.load(.seq_cst) and tries < 500) : (tries += 1) {
+            io.sleep(.fromMilliseconds(10), .awake) catch {};
+        }
+        try t.expect(hub_focused.load(.seq_cst));
+        // Focus pushes carry no model state: the windows list is untouched
+        // and no commit was queued for update() to apply.
+        state.update();
+        try t.expectEqual(@as(usize, 1), state.windows.len);
+    }
+
     // Broadcast overrides current state without any new request.
     {
         var ev: proto.Event = .{ .window_title_changed = .{ .id = 100, .title = try alloc.dupe(u8, "hello") } };

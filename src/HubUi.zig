@@ -20,7 +20,13 @@ switcher_pending: bool = false,
 switcher_armed_ms: u64 = 0,
 selected: usize = 0,
 
-hub_keyboard_focused: bool = true,
+// Compositor-authoritative hub keyboard focus. Written by State's worker
+// thread when the compositor broadcasts `shell_focus_changed` (see
+// State.bindHubFocus); read by the UI thread every frame for the
+// focus-loss edge in updateSwitcher. Atomic so the cross-thread store
+// never races a frame read. `hub_prev_*` stays a plain bool: it is
+// UI-edge state, only ever touched between frames.
+hub_keyboard_focused: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 hub_prev_keyboard_focused: bool = true,
 
 launcher_query: []const u8 = "",
@@ -71,22 +77,33 @@ suppress_clock_push: bool = false,
 // (clock -> network snapped instead of animating).
 net_toggle_pending: bool = false,
 
-// Controls -> network open transition, start ms (null = idle). Set by
-// openNetworkFaded at click time; the hub keeps rendering controls for
-// the first half of the fade (fading out) and hubFrame commits to
-// .network at the midpoint (fading in), all while the hub resize kicked
-// at click time runs its course.
+// Controls <-> network transition, start ms (null = idle). Set by
+// openNetworkFaded / closeNetworkFaded at click time; the hub renders the
+// outgoing mode for the first half of the fade (fading out) and hubFrame
+// commits to the incoming mode at the midpoint (fading in), all while the
+// hub resize kicked at click time runs its course. `fade_to_controls`
+// marks the direction: open (false) renders controls -> network, close
+// (true) renders network -> controls.
 controls_fade_start: ?u64 = null,
+fade_to_controls: bool = false,
 
 // Network panel tab. Both tabs share the panel chrome with small
 // per-tab differences (wifi: search + AP rows with connect;
 // bluetooth: device rows, status only — the worker exposes no BT
 // connect actions).
 net_tab: NetTab = .wifi,
-// Origin for the back button: set when the panel opens from a tophub
-// menu (the control center). The header shows a back button to it;
-// null = opened elsewhere (bar), no back button.
-net_return: ?HubMode = null,
+// Back-button origin: set to .controls whenever a sub-panel (network,
+// launcher, windows) opens FROM the control center, null when it opened
+// from the base UI (clock, bar button, / or Tab key). Only the network
+// header's back button reads it (the sole path back to the control
+// center, riding the close fade); Escape and keyboard-focus loss always
+// dismiss to clock, from every mode. Cleared on entering clock or
+// controls themselves.
+menu_origin: ?HubMode = null,
+// Set while a media button holds the click this frame (see clockPlayer):
+// the clock background must not treat it as a background click. Reset
+// by tophubBase every frame, read by the clock branch after it.
+media_clicked: bool = false,
 
 off_start: u64 = 0,
 
@@ -117,13 +134,34 @@ pub fn init() HubUi {
     return .{ .anim_id = .extendId(null, @src(), 0) };
 }
 
+// UI-thread read of the compositor-driven focus flag (see the field
+// comment). Short helpers so frame logic stays readable.
+pub fn hubFocused(self: *const HubUi) bool {
+    return self.hub_keyboard_focused.load(.seq_cst);
+}
+
+pub fn setHubFocused(self: *HubUi, focused: bool) void {
+    self.hub_keyboard_focused.store(focused, .seq_cst);
+}
+
 pub fn targetFor(mode: HubMode) dvui.Size {
+    return targetForMedia(mode, false);
+}
+
+// Media-aware hub sizes. Faithful to LeafShell's tophub: the clock hub is
+// always a single 50px row — 150px idle, widening to 444px when a track is
+// active: 132 clock + 26 music glyph + 160 capped title + 84 media buttons
+// (= 402) plus the 12-unit row padding on each edge and the outer chrome.
+// Sized to hug the content so the expanding text column can't leave a
+// void at the end of the pill. The control center keeps the whole
+// clock (with its player extension) attached at the top, so it is taller.
+pub fn targetForMedia(mode: HubMode, has_media: bool) dvui.Size {
     return switch (mode) {
         .windows => .{ .w = 600, .h = 120 },
         .launcher => .{ .w = 520, .h = 360 },
         .network => .{ .w = 520, .h = 420 },
-        .clock => .{ .w = 150, .h = 50 },
-        .controls => .{ .w = 520, .h = 360 },
+        .clock => if (has_media) .{ .w = 444, .h = 50 } else .{ .w = 150, .h = 50 },
+        .controls => .{ .w = 520, .h = 412 },
         else => .{ .w = 480, .h = 180 },
     };
 }
@@ -139,9 +177,11 @@ pub fn openNetworkFaded(self: *HubUi, state: *State, tab: ?NetTab) void {
         if (self.hubmode != .network) self.switchMode(.network, state);
         return;
     }
-    // Origin for the header back button.
-    self.net_return = .controls;
+    // Origin for the header back button (the only path back to the
+    // control center once the panel is open).
+    self.menu_origin = .controls;
     self.controls_fade_start = @as(u64, @intCast(std.Io.Clock.real.now(state.io).toMilliseconds()));
+    self.fade_to_controls = false;
     // Kick the resize now so it runs under the whole fade; the midpoint
     // switchMode re-sets the same target (a no-op) so the animation is
     // never restarted.
@@ -152,18 +192,58 @@ pub fn openNetworkFaded(self: *HubUi, state: *State, tab: ?NetTab) void {
     });
 }
 
+// Close the network panel back to the control center with a fade: the
+// mirror of openNetworkFaded. The resize starts now, network renders
+// fading out for the first half, and hubFrame commits to .controls at
+// the midpoint (fading in). Only valid mid-network with a controls
+// origin; anything else is a plain switchMode.
+pub fn closeNetworkFaded(self: *HubUi, state: *State) void {
+    if (self.hubmode != .network or self.controls_fade_start != null) {
+        self.switchMode(.controls, state);
+        return;
+    }
+    self.controls_fade_start = @as(u64, @intCast(std.Io.Clock.real.now(state.io).toMilliseconds()));
+    self.fade_to_controls = true;
+    self.setTarget(targetFor(.controls));
+    dvui.animation(self.anim_id, "hubfade", .{
+        .easing = dvui.easing.outQuart,
+        .end_time = 0.18 * std.time.us_per_s,
+    });
+}
+
 pub fn switchMode(self: *HubUi, mode: HubMode, state: *State) void {
     self.off_start = @as(u64, @intCast(std.Io.Clock.real.now(state.io).toMilliseconds()));
     defer self.suppress_clock_push = false;
-    // Leaving the network panel retires the tophub back-button origin
-    // (entering it never clears: the fade midpoint commits .network).
-    if (mode != .network) self.net_return = null;
-    // Leaving the control center drops an in-flight open transition, so
-    // no stale fade alpha leaks onto the next mode. The fade midpoint
-    // commit (.controls -> .network) is exempt so the second half still
-    // fades in.
-    if (mode != .controls and self.controls_fade_start != null) {
-        const fading_commit = self.hubmode == .controls and mode == .network;
+    // Origin bookkeeping: a sub-panel opened from the control center is
+    // its child, which only matters for the header back button (the sole
+    // path back to the control center, riding the close fade). Escape
+    // and focus loss always dismiss to clock, from every mode. The
+    // origin persists while navigating between panels (controls ->
+    // network -> launcher is still a controls session) and retires only
+    // when the session ends: entering clock or controls itself. The
+    // controls -> network fade stamps the origin itself; the midpoint
+    // commit below re-enters .network with hubmode == .controls, which
+    // keeps it.
+    if (mode == .clock or mode == .controls) self.menu_origin = null;
+    if (mode == .network and self.hubmode != .controls and self.controls_fade_start == null) {
+        // Opened directly (bar button, key): not a controls session.
+        // Mid-fade commit is exempt (controls_fade_start still set).
+        self.menu_origin = null;
+    }
+    if (self.hubmode == .controls and (mode == .network or mode == .launcher or mode == .windows)) {
+        // Any sub-panel opened FROM the control center starts a
+        // controls session (network stamps it in openNetworkFaded too;
+        // this also covers the fade midpoint commit re-entering
+        // .network, which must keep the origin).
+        self.menu_origin = .controls;
+    }
+    // Leaving a fading mode drops an in-flight transition, so no stale
+    // fade alpha leaks onto the next mode. The two fade midpoint commits
+    // (.controls -> .network opening, .network -> .controls closing) are
+    // exempt so their second halves still fade in.
+    if (self.controls_fade_start != null) {
+        const fading_commit = (self.hubmode == .controls and mode == .network and !self.fade_to_controls) or
+            (self.hubmode == .network and mode == .controls and self.fade_to_controls);
         if (!fading_commit) self.controls_fade_start = null;
     }
     if (mode == .clock and self.hubmode != .clock) {
@@ -174,7 +254,7 @@ pub fn switchMode(self: *HubUi, mode: HubMode, state: *State) void {
         // already moved elsewhere (click), there is nothing to push.
         // Skipped right after an explicit focusWindow (switcher), which
         // names its own target.
-        if (!self.suppress_clock_push and self.hub_keyboard_focused and state.windows.len > 0) {
+        if (!self.suppress_clock_push and self.hubFocused() and state.windows.len > 0) {
             state.focusWindow(state.windows[0].id);
         }
     }
@@ -194,6 +274,13 @@ pub fn switchMode(self: *HubUi, mode: HubMode, state: *State) void {
     // covers all of them exactly once.
     if (self.hubmode == .clock and mode != .clock) {
         state.requestHubFocus();
+        // Swallow any focus edge in flight at open time: the request
+        // above is asynchronous, and the click that opened the panel
+        // may have moved focus away from the hub surface a moment ago.
+        // Syncing prev here means the edge detector only fires on
+        // transitions observed AFTER the open — a loss must first be
+        // preceded by a polled frame with focus actually granted.
+        self.hub_prev_keyboard_focused = self.hubFocused();
     }
     if (mode == .launcher) {
         if (self.hubmode != .launcher) {
@@ -217,7 +304,7 @@ pub fn switchMode(self: *HubUi, mode: HubMode, state: *State) void {
         self.last_hubmode = mode;
     }
     self.hubmode = mode;
-    self.setTarget(targetFor(mode));
+    self.setTarget(targetForMedia(mode, state.media.active()));
 }
 
 fn clearNetSel(self: *HubUi, state: *State) void {
@@ -229,16 +316,18 @@ fn clearNetSel(self: *HubUi, state: *State) void {
     self.net_reject_ap = 0;
 }
 
+// Where a dismissal (Escape, keyboard-focus loss) lands: always clock,
+// from every mode. The controls back button is the only path back to
+// the control center (it rides the close fade); Escape and focus loss
+// end the session outright.
+fn dismissHome(self: *HubUi, state: *State) void {
+    self.switchMode(.clock, state);
+}
+
 pub fn handleNetworkKey(self: *HubUi, code: dvui.enums.Key, action: KeyAction, state: *State) bool {
     if (code == .escape and action == .down) {
         self.clearNetSel(state);
-        // Escape returns to the tophub origin when the panel came from
-        // the control center, otherwise to clock mode.
-        if (self.net_return) |ret| {
-            self.switchMode(ret, state);
-        } else {
-            self.switchMode(.clock, state);
-        }
+        self.dismissHome(state);
         return true;
     }
     return false;
@@ -266,23 +355,20 @@ pub fn toggleNetworkMenu(self: *HubUi, state: *State) void {
     if (self.controls_fade_start != null) return;
     if (self.hubmode == .network) {
         self.clearNetSel(state);
-        // Closing from the bar always lands in clock mode, even when
-        // the panel came from the control center (Escape and the back
-        // button are the ways back to it).
+        // Closing from the bar always lands in clock mode (like every
+        // dismissal: Escape and focus loss also land in clock, from
+        // every mode; only the header back button returns to controls).
         self.switchMode(.clock, state);
     } else if (self.hubmode == .controls) {
         // Same fade as tapping a toggle: resize starts now, the mode
         // commits at the fade midpoint in hubFrame. No tab hint from
         // the bar: keep the current tab.
         self.openNetworkFaded(state, null);
-        self.hub_prev_keyboard_focused = self.hub_keyboard_focused;
     } else {
+        // Focus-loss dismissal right after opening is suppressed by
+        // updateSwitcher's settle window (off_start); no manual
+        // prev-focus patching needed here.
         self.switchMode(.network, state);
-        // Opening from the bar can coincide with the hub losing OS focus
-        // (click moves focus to the bar surface). Swallow that edge so
-        // updateSwitcher's focus-loss dismissal doesn't close the panel
-        // on the same frame it opened; later edges still dismiss.
-        self.hub_prev_keyboard_focused = self.hub_keyboard_focused;
     }
 }
 
@@ -305,7 +391,6 @@ pub fn selectPrev(self: *HubUi, state: *State) void {
     }
     self.selected = (self.selected + state.windows.len - 1) % state.windows.len;
 }
-
 pub fn commitSwitcherSelection(self: *HubUi, state: *State) void {
     if (state.windows.len == 0) return;
     if (self.selected >= state.windows.len) self.selectIndex(state, self.selected);
@@ -451,7 +536,7 @@ pub fn handleGlobalKey(self: *HubUi, code: dvui.enums.Key, action: KeyAction, sh
         if (self.hubmode == .windows) {
             return false;
         }
-        if (self.hub_keyboard_focused) {
+        if (self.hubFocused()) {
             if (state.windows.len == 0) return false;
             if (shift) {
                 self.selectPrev(state);
@@ -478,8 +563,7 @@ pub fn handleGlobalKey(self: *HubUi, code: dvui.enums.Key, action: KeyAction, sh
 
 pub fn handleLauncherKey(self: *HubUi, code: dvui.enums.Key, action: KeyAction, state: *State) bool {
     if (code == .escape and action == .down) {
-        // Dismissing a menu always lands in clock mode.
-        self.switchMode(.clock, state);
+        self.dismissHome(state);
         return true;
     }
     if (code == .enter and action == .down) {
@@ -503,8 +587,7 @@ pub fn handleWindowsKey(self: *HubUi, code: dvui.enums.Key, action: KeyAction, s
     if (code == .escape and action == .down) {
         self.switcher_pending = false;
         self.selectIndex(state, 0);
-        // Dismissing a menu always lands in clock mode.
-        self.switchMode(.clock, state);
+        self.dismissHome(state);
         return true;
     }
     return false;
@@ -514,10 +597,15 @@ pub fn updateSwitcher(self: *HubUi, now_ms: u64, state: *State) HubMode {
     if (self.switcher_pending and self.hubmode != .windows and now_ms -% self.switcher_armed_ms >= 180) {
         self.switchMode(.windows, state);
     }
-    const focus_lost = !self.hub_keyboard_focused and self.hub_prev_keyboard_focused;
+    // Single owner of the focus edge. switchMode syncs prev at open
+    // time (see its requestHubFocus block), so an edge here is always a
+    // transition observed across polled frames after the open: a panel
+    // that never gained focus can't dismiss via a stale pre-open edge.
+    const focus_lost = !self.hubFocused() and self.hub_prev_keyboard_focused;
     if (focus_lost) {
-        // Losing keyboard focus always lands back in clock mode: the
-        // hub is a transient overlay, never a place to linger unfocused.
+        // Losing keyboard focus always dismisses to clock, from every
+        // mode. The hub is a transient overlay, never a place to linger
+        // unfocused.
         if (self.switcher_pending or self.hubmode == .windows) {
             if (state.windows.len > 0) self.commitSwitcherSelection(state);
             self.switcher_pending = false;
@@ -529,12 +617,11 @@ pub fn updateSwitcher(self: *HubUi, now_ms: u64, state: *State) HubMode {
             self.clearNetSel(state);
         }
         if (self.hubmode != .clock) {
-            self.switchMode(.clock, state);
+            self.dismissHome(state);
         }
     }
     return self.hubmode;
 }
-
 pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _win_hub: anytype) !dvui.App.Result {
     _ = _io;
     _ = _win_hub;
@@ -546,6 +633,31 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
     if (self.net_toggle_pending) {
         self.net_toggle_pending = false;
         self.toggleNetworkMenu(state);
+    }
+
+    // Media-driven hub resize: when a player appears/disappears while the
+    // clock or control center is open, converge on the matching size.
+    // setTarget is a no-op when the size already matches, so running this
+    // every frame is free. Other panels override entirely (no clock).
+    {
+        const want_media = state.media.active();
+        if (self.hubmode == .clock or self.hubmode == .controls) {
+            self.setTarget(targetForMedia(self.hubmode, want_media));
+        }
+        // While a track plays the seek bar interpolates locally, but it
+        // still needs frames to advance: tick hot at 4fps. Paused/stopped
+        // falls back to the loop's normal input-driven wakeups.
+        if (want_media and (self.hubmode == .clock or self.hubmode == .controls)) {
+            var msnap_hot = state.media.snapshotCopy(state.alloc);
+            defer msnap_hot.deinit(state.alloc);
+            if (msnap_hot.status == .playing) {
+                if (dvui.timerDone(self.anim_id)) {
+                    dvui.timer(self.anim_id, 250_000);
+                } else if (dvui.timerGet(self.anim_id) == null) {
+                    dvui.timer(self.anim_id, 250_000);
+                }
+            }
+        }
     }
 
     // Keyboard focus follows the panel: exclusive asks the compositor
@@ -610,9 +722,9 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
 
     const now = @as(u64, @intCast(std.Io.Clock.real.now(state.io).toMilliseconds()));
 
-    const focus_gained = self.hub_keyboard_focused and !self.hub_prev_keyboard_focused;
-    _ = focus_gained;
-    defer self.hub_prev_keyboard_focused = self.hub_keyboard_focused;
+    // Prev tracks the last frame's polled value; updateSwitcher owns the
+    // edge detection above, so no manual syncing is needed anywhere else.
+    defer self.hub_prev_keyboard_focused = self.hubFocused();
 
     for (dvui.events()) |ev| {
         if (ev.evt != .key) continue;
@@ -623,16 +735,21 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
             else => .repeat,
         };
         // Same helpers the headless JSON harness drives, so tested
-        // behavior is the wired behavior.
+        // behavior is the wired behavior. Focus-loss dismissal is
+        // updateSwitcher's job (edge + settle logic live there); key
+        // events never trigger it.
         if (self.handleGlobalKey(k.code, action, k.mod.shift(), now, state)) break;
+        if (ev.evt.key.code == .escape and !self.hubFocused())
+            self.switchMode(.clock, state);
     }
 
     _ = self.updateSwitcher(now, state);
 
-    // Controls -> network open transition (see openNetworkFaded): the
-    // resize was kicked at click time. The first half renders controls
-    // fading out; at the midpoint the mode commits so the second half
-    // renders network fading in.
+    // Controls <-> network transition (see openNetworkFaded /
+    // closeNetworkFaded): the resize was kicked at click time. The
+    // first half renders the outgoing mode fading out; at the midpoint
+    // the mode commits so the second half renders the incoming mode
+    // fading in.
     var fade_alpha: ?f32 = null;
     if (self.controls_fade_start) |fstart| {
         const el = now -% fstart;
@@ -643,7 +760,12 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
             if (ft < 0.5) {
                 fade_alpha = 1.0 - ft * 2.0;
             } else {
-                if (self.hubmode == .controls) self.switchMode(.network, state);
+                // Midpoint commit: whichever direction the fade runs.
+                if (!self.fade_to_controls) {
+                    if (self.hubmode == .controls) self.switchMode(.network, state);
+                } else {
+                    if (self.hubmode == .network) self.switchMode(.controls, state);
+                }
                 fade_alpha = ft * 2.0 - 1.0;
             }
         }
@@ -655,10 +777,23 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
         .clock => {
             var hover = false;
             defer self.hub_was_hovered = hover;
-            const clicked = dvui.clicked(outer.data(), .{
-                .hovered = &hover,
-                .hover_cursor = .arrow,
-            });
+            // Hover state without consuming clicks: position events are
+            // never marked handled, so this scan is invisible to the
+            // widgets below. (The background click itself is evaluated
+            // after tophubBase for the same reason: the player slots
+            // must see button presses first — first handler wins, and
+            // handled/captured events are skipped for later widgets.)
+            {
+                const orect = outer.data().borderRectScale().r;
+                for (dvui.events()) |ev| {
+                    switch (ev.evt) {
+                        .mouse => |me| {
+                            if (me.action == .position and orect.contains(me.p)) hover = true;
+                        },
+                        else => {},
+                    }
+                }
+            }
             if (hover and !self.hub_was_hovered) {
                 dvui.animation(outer.data().id, "hover", .{
                     .easing = dvui.easing.outExpo,
@@ -684,63 +819,34 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
                 outer.drawBackground();
             }
 
-            const ts = std.Io.Clock.real.now(state.io);
-            const s = ts.toSeconds();
-            const stamp = std.time.epoch.EpochSeconds{ .secs = @intCast(s) };
-            const ds = stamp.getDaySeconds();
-            const d = stamp.getEpochDay();
-            const dy = d.calculateYearDay();
-            const txt = try std.fmt.allocPrint(state.alloc, "{}:{}:{}", .{
-                ds.getHoursIntoDay(),
-                ds.getMinutesIntoHour(),
-                ds.getSecondsIntoMinute(),
-            });
-            defer state.alloc.free(txt);
-            dvui.labelNoFmt(
-                @src(),
-                txt,
-                .{ .align_y = 0.5, .align_x = 0.5 },
-                .{
-                    .expand = .both,
-                    .font = t.font_mono.withWeight(.bold).withSize(12.0),
-                    .color_text = t.color(.highlight, .fill).lighten(5),
-                    .padding = .{ .y = 6 },
-                },
-            );
-            const dw = [_][]const u8{
-                "Thursday", "Friday",  "Saturday",  "Sunday",
-                "Monday",   "Tuesday", "Wednesday",
-            };
-            const ms = [_][]const u8{
-                "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-            };
-            const dname = dw[@as(usize, @intCast(@divFloor(s, 86400))) % dw.len];
-            const dm = dy.calculateMonthDay();
-            const txt_ = try std.fmt.allocPrint(state.alloc, "{s}, {s} {}", .{
-                dname,
-                ms[dm.month.numeric() - 1],
-                dm.day_index + 1,
-            });
-            defer state.alloc.free(txt_);
-            dvui.labelNoFmt(
-                @src(),
-                txt_,
-                .{ .align_y = 0.5, .align_x = 0.5 },
-                .{
-                    .expand = .both,
-                    .font = t.font_mono.withSize(8.0),
-                    .padding = .{ .h = 6 },
-                },
-            );
-            if (clicked) self.handleClockClick(state);
-            {
-                var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .gravity_x = 0.5 });
+            // Shared top strip (clock, plus the player beside it while a
+            // track is active): one function renders it identically in
+            // the clock pill and the control-center header. The player
+            // slots handle their clicks here, before the background
+            // check below — so button presses never fall through.
+            const show_player = self.tophubBase(state, t, 0);
+            if (!show_player) {
+                var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                    .expand = .horizontal,
+                    .tag = "launcher_row",
+                });
                 defer row.deinit();
+                // Single button in a horizontal box packs left (gravity
+                // defaults to 0.0): spacers on both sides center it.
+                _ = dvui.spacer(@src(), .{ .expand = .horizontal });
                 if (dvui.button(@src(), "Launcher  \u{2318}P / /", .{}, .{ .min_size_content = .{ .h = 18 } })) {
                     self.switchMode(.launcher, state);
                 }
+                _ = dvui.spacer(@src(), .{ .expand = .horizontal });
             }
+            // Background click opens the control center — evaluated last,
+            // so presses the player slots already handled (and captured)
+            // are skipped here. The media_clicked veto covers the rest.
+            const clicked = dvui.clicked(outer.data(), .{
+                .hovered = &hover,
+                .hover_cursor = .arrow,
+            });
+            if (clicked and !self.media_clicked) self.handleClockClick(state);
         },
         .windows => {
             const list = dvui.flexbox(
@@ -863,7 +969,7 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
                     .padding = .{ .w = 4, .h = 6, .y = 6, .x = 4 },
                 });
                 defer te.deinit();
-                if (self.launcher_need_focus and self.hub_keyboard_focused) {
+                if (self.launcher_need_focus and self.hubFocused()) {
                     dvui.focusWidget(te.data().id, null, null);
                     self.launcher_need_focus = false;
                 }
@@ -938,9 +1044,10 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
                                 break;
                             };
                             state.launcher.run(idx);
-                        }
-                        if (btn.clicked() or !self.hub_keyboard_focused)
+                            // Running an app ends the session regardless of
+                            // origin (focus goes to the new app).
                             self.switchMode(.clock, state);
+                        }
                         var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{
                             .expand = .horizontal,
                             .background = false,
@@ -1055,6 +1162,18 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
             // Last frame's typing state fed a row2 highlight that is gone
             // (focus now shows only via the entry's own focus border);
             // net_typing/net_typing_since retired with it.
+            // Key handling mirrors launcher/windows: the same helpers the
+            // headless harness drives. Escape dismisses to clock.
+            for (dvui.events()) |ev| {
+                if (ev.evt != .key) continue;
+                const k = ev.evt.key;
+                const action: KeyAction = switch (k.action) {
+                    .down => .down,
+                    .up => .up,
+                    else => .repeat,
+                };
+                if (self.handleNetworkKey(k.code, action, state)) break;
+            }
             {
                 var row = dvui.box(@src(), .{ .dir = .vertical }, .{
                     .expand = .both,
@@ -1077,7 +1196,7 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
                         .margin = .{ .h = 6 },
                     });
                     defer header.deinit();
-                    if (self.net_return) |ret| {
+                    if (self.menu_origin != null) {
                         var back: dvui.ButtonWidget = undefined;
                         back.init(@src(), .{
                             .draw_focus = false,
@@ -1105,9 +1224,10 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
                             });
                         }
                         if (back.clicked()) {
+                            // Back rides the close fade to the control
+                            // center; Escape and focus loss go to clock.
                             self.clearNetSel(state);
-                            self.net_return = null;
-                            self.switchMode(ret, state);
+                            self.closeNetworkFaded(state);
                         }
                         back.deinit();
                     }
@@ -1261,7 +1381,7 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
                             .margin = .{ .h = 8 },
                         });
                         defer qbox.deinit();
-                        if (self.net_need_focus and self.hub_keyboard_focused) {
+                        if (self.net_need_focus and self.hubFocused()) {
                             dvui.focusWidget(qbox.data().id, null, null);
                             self.net_need_focus = false;
                         }
@@ -1782,29 +1902,20 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
                     }
                 }
             }
-            // Dismiss when the hub loses keyboard focus, on Escape, or
-            // when the focused app window moves elsewhere (MRU head
-            // change vs the open baseline — covers clicks the hub never
-            // sees as SDL focus events).
+            // Dismiss when the focused app window moves elsewhere (MRU
+            // head change vs the open baseline — covers clicks the hub
+            // never sees as focus events). Focus loss and Escape are
+            // updateSwitcher's and handleNetworkKey's jobs; this only
+            // adds the app-switch detector.
             const focused_elsewhere = state.windows.len > 0 and self.net_open_win != 0 and
                 state.windows[0].id != self.net_open_win;
             // off_start is stamped with a fresh clock read inside
             // switchMode, which can run mid-frame (fade midpoint
             // commit) after `now` was read at frame top — so `now`
             // can be a tick older. Saturate instead of underflowing.
-            const esc_pressed = pressed(.escape);
-            if (saturatingAge(now, self.off_start) > 500 and
-                (!self.hub_keyboard_focused or esc_pressed or focused_elsewhere))
-            {
-                // Escape honors the tophub origin; every other
-                // dismissal path lands in clock mode.
-                const esc_home = if (esc_pressed) self.net_return else null;
+            if (saturatingAge(now, self.off_start) > 500 and focused_elsewhere) {
                 self.clearNetSel(state);
-                if (esc_home) |ret| {
-                    self.switchMode(ret, state);
-                } else {
-                    self.switchMode(.clock, state);
-                }
+                self.dismissHome(state);
             }
         },
         .controls => {
@@ -1814,6 +1925,29 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
                 .expand = .both,
             });
             defer outer_.deinit();
+
+            // Escape dismisses the control center itself straight to
+            // clock (it is a direct member, never a child).
+            for (dvui.events()) |ev| {
+                if (ev.evt != .key) continue;
+                const k = ev.evt.key;
+                const action: KeyAction = switch (k.action) {
+                    .down => .down,
+                    .up => .up,
+                    else => .repeat,
+                };
+                if (k.code == .escape and action == .down) {
+                    self.dismissHome(state);
+                    break;
+                }
+            }
+
+            // Attached clock: the whole clock hub (with its player
+            // extension while a track is active) stays on top of the
+            // control center, one panel — the same tophubBase strip as
+            // the clock pill. Sub-panels (network, launcher, switcher)
+            // override entirely — no clock content there.
+            _ = self.tophubBase(state, t, 100);
 
             {
                 var snap = state.net.snapshotCopy(state.alloc);
@@ -1920,6 +2054,274 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
     }
 
     return .ok;
+}
+
+// Shared top strip — the whole clock hub as one row: fixed 132px clock
+// column, player extension beside it while a track is active (exactly
+// LeafShell's Clock + MediaPlayer). Rendered identically in the clock
+// pill and on top of the control center, so the two never drift: no
+// call-site container code, just this function. The media snapshot is a
+// per-frame copy on the GPA, owned and freed here (immediate mode: it
+// only has to live for this call). Returns whether the player
+// extension is showing (clock mode shows the launcher row instead when
+// it isn't); media clicks land on HubUi.media_clicked directly.
+// `id_extra` keeps widget ids distinct between the two live contexts
+// (clock pill = 0, control-center header = 100): both live in the hub
+// window, so sharing @src() ids would bleed per-widget state across
+// mode switches.
+pub fn tophubBase(self: *HubUi, state: *State, t: *dvui.Theme, id_extra: usize) bool {
+    // Fresh every frame: a stale true from a clicked-then-closed player
+    // must never veto a later background click.
+    self.media_clicked = false;
+    const media_active = state.media.active();
+    var msnap = if (media_active) state.media.snapshotCopy(state.alloc) else null;
+    defer if (msnap) |*m| m.deinit(state.alloc);
+    const show_player = if (msnap) |*m| m.has_media and m.status != .stopped else false;
+
+    var strip = dvui.box(@src(), .{ .dir = .horizontal }, .{
+        .expand = .horizontal,
+        .background = false,
+        // 12 units on both horizontal edges; padding (not margin)
+        // shrinks the content box, so dvui clips the title text against
+        // it instead of pushing the fixed-size media buttons out past
+        // the hub edge.
+        .padding = .{ .x = 12, .w = 12 },
+        .id_extra = id_extra,
+        .tag = "tophub",
+    });
+    defer strip.deinit();
+    {
+        var clockbox = dvui.box(@src(), .{ .dir = .vertical }, .{
+            .background = false,
+            .gravity_y = 0.5,
+            .min_size_content = .{ .w = 132 },
+            .max_size_content = dvui.Options.MaxSize.width(132),
+            .id_extra = id_extra,
+            .tag = "tophub_clock",
+        });
+        defer clockbox.deinit();
+        // Playing: LeafShell left-aligns the clock beside the player;
+        // stopped/idle centers it.
+        self.clockLabels(state, t, !show_player);
+    }
+    if (show_player) self.media_clicked = self.clockPlayer(state, t, msnap.?, id_extra);
+    return show_player;
+}
+
+// Clock face shared by the clock hub and the control-center header:
+// time over date, centered in the idle pill, left-aligned beside the
+// player (see tophubBase).
+pub fn clockLabels(self: *HubUi, state: *State, t: *dvui.Theme, centered: bool) void {
+    _ = self;
+    const ts = std.Io.Clock.real.now(state.io);
+    const s = ts.toSeconds();
+    const stamp = std.time.epoch.EpochSeconds{ .secs = @intCast(s) };
+    const ds = stamp.getDaySeconds();
+    const d = stamp.getEpochDay();
+    const dy = d.calculateYearDay();
+    const ax: f32 = if (centered) 0.5 else 0.0;
+    const txt = std.fmt.allocPrint(state.alloc, "{}:{}:{}", .{
+        ds.getHoursIntoDay(),
+        ds.getMinutesIntoHour(),
+        ds.getSecondsIntoMinute(),
+    }) catch return;
+    defer state.alloc.free(txt);
+    dvui.labelNoFmt(
+        @src(),
+        txt,
+        .{ .align_y = 0.5, .align_x = ax },
+        .{
+            .expand = .both,
+            .font = t.font_mono.withWeight(.bold).withSize(12.0),
+            .color_text = t.color(.highlight, .fill).lighten(5),
+            .padding = .{ .y = 6 },
+        },
+    );
+    const dw = [_][]const u8{
+        "Thursday", "Friday",  "Saturday", "Sunday",
+        "Monday",   "Tuesday", "Wednesday",
+    };
+    const ms = [_][]const u8{
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    };
+    const dname = dw[@as(usize, @intCast(@divFloor(s, 86400))) % dw.len];
+    const dm = dy.calculateMonthDay();
+    const txt_ = std.fmt.allocPrint(state.alloc, "{s}, {s} {}", .{
+        dname,
+        ms[dm.month.numeric() - 1],
+        dm.day_index + 1,
+    }) catch return;
+    defer state.alloc.free(txt_);
+    dvui.labelNoFmt(
+        @src(),
+        txt_,
+        .{ .align_y = 0.5, .align_x = ax },
+        .{
+            .expand = .both,
+            .font = t.font_mono.withSize(8.0),
+            .padding = .{ .h = 6 },
+        },
+    );
+}
+
+// Embedded media player: LeafShell's MediaPlayer beside the clock —
+// music glyph, capped title with a thin seek readout, and the media
+// buttons (skip-back / play-pause / skip-forward, 28px each = the 84px
+// budget).
+// The buttons are invisible hit areas: plain boxes with no background,
+// hover, press, or focus visuals whatsoever — the row looks exactly
+// like static content, clicks just work. Returns true when a media
+// button consumed the click, so the clock background handler doesn't
+// also fire (see hubFrame's veto).
+// `id_extra` keeps widget ids distinct between the clock pill (0) and
+// the control-center header (100): both live in the hub window.
+pub fn clockPlayer(self: *HubUi, state: *State, t: *dvui.Theme, snap: State.Media.Snapshot, id_extra: usize) bool {
+    var prow = dvui.box(@src(), .{ .dir = .horizontal }, .{
+        .expand = .both,
+        .background = false,
+        .gravity_y = 0.5,
+        .id_extra = id_extra,
+        .tag = "player_row",
+    });
+    defer prow.deinit();
+
+    // Music glyph: fixed 26px column, rasterized at display size.
+    if (Icons.iconPx(.music, 24, .white) catch null) |crisp| {
+        _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+            .gravity_y = 0.5,
+            .min_size_content = .{ .w = 26, .h = 26 },
+            .max_size_content = .{ .w = 26, .h = 26 },
+            .id_extra = id_extra,
+        });
+    }
+    _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 6 } });
+
+    // Title + seek readout: capped at 160 so the fixed-size buttons
+    // never shift (see targetForMedia's budget).
+    {
+        var tcol = dvui.box(@src(), .{ .dir = .vertical }, .{
+            .expand = .horizontal,
+            .background = false,
+            .gravity_y = 0.5,
+            .max_size_content = dvui.Options.MaxSize.width(160),
+            .id_extra = id_extra,
+            .padding = .fromSize(.{ .h = 12 }),
+        });
+        defer tcol.deinit();
+        var title_buf: [64]u8 = undefined;
+        const title = State.Media.truncateTitle(&title_buf, snap.title, 30);
+        dvui.labelNoFmt(@src(), title, .{
+            .align_x = 0.0,
+            .align_y = 0.5,
+        }, .{
+            .font = t.font_body.withSize(11.0),
+            .id_extra = id_extra,
+            .gravity_x = 0.0,
+        });
+        dvui.progress(@src(), .{ .percent = snap.frac() }, .{
+            .expand = .horizontal,
+            // Explicit zero padding: progress_defaults force padding 2
+            // on all sides, and progress draws the fill in the CONTENT
+            // rect (size minus padding) — with the height pinned below,
+            // any padding eats the bar itself (a 4px pin + 2+2 padding =
+            // ~0px of visible fill). Zero padding makes the content rect
+            // equal the widget rect, so the pin below is the true
+            // thickness.
+            .padding = .all(0),
+            .min_size_content = .{ .h = 6 },
+            .max_size_content = dvui.Options.MaxSize.height(6),
+            .corners = .all(6),
+            .margin = .{ .y = 2 },
+            .id_extra = id_extra,
+            .gravity_x = 0.0,
+        });
+    }
+    _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 6 } });
+
+    // Media buttons: three invisible 28px hit areas with 20px glyphs.
+    // Plain boxes (background = false, no hover/press/focus styling at
+    // all): `dvui.clicked` on the box rect is the entire interaction —
+    // nothing about the row's appearance changes, in any state (not
+    // even the cursor: hover_cursor is nulled). One block per button:
+    // the icon is a comptime tabler name, so the play/pause swap needs
+    // its own branch (no runtime icon values).
+    const btn_px: f32 = 28;
+    const glyph_px: f32 = 20;
+    {
+        var slot = dvui.box(@src(), .{}, .{
+            .background = false,
+            .min_size_content = .{ .w = btn_px, .h = btn_px },
+            .max_size_content = .{ .w = btn_px, .h = btn_px },
+            .gravity_y = 0.5,
+            .id_extra = id_extra * 10,
+        });
+        if (Icons.iconPx(.player_skip_back, glyph_px, .white) catch null) |crisp| {
+            _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+                .gravity_x = 0.5,
+                .gravity_y = 0.5,
+                .min_size_content = .{ .w = glyph_px, .h = glyph_px },
+            });
+        }
+        if (dvui.clicked(slot.data(), .{ .hover_cursor = null })) {
+            self.media_clicked = true;
+            _ = state.media.previous();
+        }
+        slot.deinit();
+    }
+    {
+        var slot = dvui.box(@src(), .{}, .{
+            .background = false,
+            .min_size_content = .{ .w = btn_px, .h = btn_px },
+            .max_size_content = .{ .w = btn_px, .h = btn_px },
+            .gravity_y = 0.5,
+            .id_extra = id_extra * 10 + 1,
+        });
+        if (snap.status == .playing) {
+            if (Icons.iconPx(.player_pause, glyph_px, .white) catch null) |crisp| {
+                _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+                    .gravity_x = 0.5,
+                    .gravity_y = 0.5,
+                    .min_size_content = .{ .w = glyph_px, .h = glyph_px },
+                });
+            }
+        } else {
+            if (Icons.iconPx(.player_play, glyph_px, .white) catch null) |crisp| {
+                _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+                    .gravity_x = 0.5,
+                    .gravity_y = 0.5,
+                    .min_size_content = .{ .w = glyph_px, .h = glyph_px },
+                });
+            }
+        }
+        if (dvui.clicked(slot.data(), .{ .hover_cursor = null })) {
+            self.media_clicked = true;
+            _ = state.media.playPause();
+        }
+        slot.deinit();
+    }
+    {
+        var slot = dvui.box(@src(), .{}, .{
+            .background = false,
+            .min_size_content = .{ .w = btn_px, .h = btn_px },
+            .max_size_content = .{ .w = btn_px, .h = btn_px },
+            .gravity_y = 0.5,
+            .id_extra = id_extra * 10 + 2,
+        });
+        if (Icons.iconPx(.player_skip_forward, glyph_px, .white) catch null) |crisp| {
+            _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+                .gravity_x = 0.5,
+                .gravity_y = 0.5,
+                .min_size_content = .{ .w = glyph_px, .h = glyph_px },
+            });
+        }
+        if (dvui.clicked(slot.data(), .{ .hover_cursor = null })) {
+            self.media_clicked = true;
+            _ = state.media.next();
+        }
+        slot.deinit();
+    }
+    return self.media_clicked;
 }
 
 pub fn handleClockClick(self: *HubUi, state: *State) void {

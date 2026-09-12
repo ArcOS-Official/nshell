@@ -4,6 +4,7 @@ const nilebank = @import("nilebank");
 const proto = nilebank.protocols.compositor;
 const Launcher = @import("Launcher.zig");
 pub const Net = @import("Net.zig");
+pub const Media = @import("Media.zig");
 
 const State = @This();
 
@@ -163,6 +164,8 @@ launcher: Launcher = .{},
 
 net: Net = .{},
 
+media: Media = .{},
+
 // Capture backoff (boot-ms timestamp; 0 = no backoff). The server may
 // answer capture_* with error code 3 when it can't serve a frame right now
 // ("capture not implemented" on old servers, or transient busy/not-ready on
@@ -185,6 +188,15 @@ focus_switches_workspace: std.atomic.Value(bool) = std.atomic.Value(bool).init(t
 // main.zig wires it to dvui.refresh.
 wakeup_ctx: ?*anyopaque = null,
 wakeup_fn: ?WakeupFn = null,
+
+// Compositor-driven hub keyboard focus. Bound by main.zig to
+// HubUi.hub_keyboard_focused (which State must not import — HubUi imports
+// State, so the type would cycle): the worker thread stores through this
+// pointer when the compositor broadcasts `shell_focus_changed`, and the UI
+// thread loads it every frame for the focus-loss edge. Null until bound;
+// cleared on deinit. Guarded by `closed` on the write path so a late push
+// racing deinit can't touch a dead HubUi.
+hub_focus: ?*std.atomic.Value(bool) = null,
 
 pub const WakeupFn = *const fn (?*anyopaque) void;
 
@@ -224,14 +236,17 @@ pub fn initWithWakeup(
     self.focus_switches_workspace = std.atomic.Value(bool).init(true);
     self.wakeup_ctx = wakeup_ctx;
     self.wakeup_fn = wakeup_fn;
+    self.hub_focus = null;
     self.launcher.init(alloc, io);
     self.net.init(alloc, io);
+    self.media.init(alloc, io);
     self.inited.store(true, .seq_cst);
 }
 
 pub fn deinit(self: *State) void {
     self.stop.store(true, .seq_cst);
     self.closed.store(true, .seq_cst);
+    self.hub_focus = null;
     self.dropConn();
     // The worker exits promptly: closing the connection fails any in-flight
     // request, and the loop checks `stop` every tick. Bounded wait so a
@@ -257,6 +272,7 @@ pub fn deinit(self: *State) void {
     self.commit_q.deinit(self.alloc);
     self.launcher.deinit();
     self.net.deinit();
+    self.media.deinit();
 }
 
 // UI -> worker: just enqueue; the worker sends on its own connection.
@@ -268,6 +284,14 @@ pub fn switchWorkspace(self: *State, id: u64) void {
 
 pub fn focusWindow(self: *State, id: u64) void {
     self.req_q.push(self.alloc, self.io, .{ .focus_window = id });
+}
+
+// Bind the worker-driven focus flag (normally
+// &HubUi.hub_keyboard_focused; taken as a bare atomic to avoid a HubUi
+// import cycle). From then on every `shell_focus_changed` push stores
+// through it. Call once after init, before the worker serves pushes.
+pub fn bindHubFocus(self: *State, focus: *std.atomic.Value(bool)) void {
+    self.hub_focus = focus;
 }
 
 // Ask the compositor for keyboard focus on the hub layer surface (the
@@ -475,6 +499,11 @@ pub fn worker(self: *State, io: std.Io) void {
             break :blk false;
         };
         if (net_changed) self.requestRefresh();
+        const media_changed = self.media.tick() catch |e| blk: {
+            std.log.err("Media error {s}", .{@errorName(e)});
+            break :blk false;
+        };
+        if (media_changed) self.requestRefresh();
         const conn = self.ensureConn(io, &next_connect_ms) orelse {
             io.sleep(.fromMilliseconds(200), .awake) catch return;
             continue;
@@ -526,7 +555,20 @@ pub fn worker(self: *State, io: std.Io) void {
 // ---------------------------------------------------------------------------
 fn onEvent(ctx: ?*anyopaque, msg: nilebank.Message) void {
     const self: *State = @ptrCast(@alignCast(ctx orelse return));
-    const ev = proto.Event.decodeAllocWith(self.alloc, msg.kind, msg.data, msg.encoding) catch return;
+    var ev = proto.Event.decodeAllocWith(self.alloc, msg.kind, msg.data, msg.encoding) catch return;
+    // Shell keyboard focus is worker-owned: store straight through the
+    // bound HubUi flag instead of the commit queue (applyEvent has no
+    // HubUi access, and the UI only needs the latest value). The atomic
+    // keeps this reader-fiber store from racing frame reads.
+    if (ev == .shell_focus_changed) {
+        const focused = ev.shell_focus_changed.focused;
+        ev.deinit(self.alloc);
+        if (!self.closed.load(.seq_cst)) {
+            if (self.hub_focus) |f| f.store(focused, .seq_cst);
+        }
+        self.requestRefresh();
+        return;
+    }
     self.commitEvent(ev);
     self.requestRefresh();
 }
