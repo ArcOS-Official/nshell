@@ -667,23 +667,20 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
         // While a track plays the seek bar interpolates locally, but it
         // still needs frames to advance: tick hot at 4fps. Paused/stopped
         // falls back to the loop's normal input-driven wakeups. Active
-        // activity indicators blink on a 1s loop, so they need frames too.
+        // activity indicators breathe on a sine loop, so they need frames
+        // too — hotter (10fps) so the glide stays smooth.
+        var hot_us: ?i32 = null;
         if (want_media and (self.hubmode == .clock or self.hubmode == .controls)) {
             var msnap_hot = state.media.snapshotCopy(state.alloc);
             defer msnap_hot.deinit(state.alloc);
-            if (msnap_hot.status == .playing) {
-                if (dvui.timerDone(self.anim_id)) {
-                    dvui.timer(self.anim_id, 250_000);
-                } else if (dvui.timerGet(self.anim_id) == null) {
-                    dvui.timer(self.anim_id, 250_000);
-                }
-            }
+            if (msnap_hot.status == .playing) hot_us = 250_000;
         }
-        if (n_ind > 0 and (self.hubmode == .clock or self.hubmode == .controls)) {
+        if (n_ind > 0 and (self.hubmode == .clock or self.hubmode == .controls)) hot_us = 100_000;
+        if (hot_us) |micros| {
             if (dvui.timerDone(self.anim_id)) {
-                dvui.timer(self.anim_id, 250_000);
+                dvui.timer(self.anim_id, micros);
             } else if (dvui.timerGet(self.anim_id) == null) {
-                dvui.timer(self.anim_id, 250_000);
+                dvui.timer(self.anim_id, micros);
             }
         }
     }
@@ -2257,6 +2254,7 @@ pub fn tophubBase(self: *HubUi, state: *State, t: *dvui.Theme, id_extra: usize) 
         .tag = "tophub",
     });
     defer strip.deinit();
+    self.activityStrip(state, id_extra);
     {
         var clockbox = dvui.box(@src(), .{ .dir = .vertical }, .{
             .background = false,
@@ -2272,23 +2270,21 @@ pub fn tophubBase(self: *HubUi, state: *State, t: *dvui.Theme, id_extra: usize) 
         self.clockLabels(state, t, !show_player);
     }
     if (show_player) self.media_clicked = self.clockPlayer(state, t, msnap.?, id_extra);
-    self.activityStrip(state, id_extra);
     return show_player;
 }
 
-// Activity indicators on the right of the clock strip: recording (red),
+// Activity indicators on the left of the clock strip: recording (red),
 // screenshare (green), camera/mic use (blue), downloads (light gray).
-// Blinking loops lighter->darker on a 1s wall-clock phase (hubFrame keeps
-// frames coming while any indicator is live, so no per-icon animation
-// state is needed). The pill widens 30px per indicator (see
-// targetForFull); the clock column keeps its width so the face never
-// shifts when indicators come and go.
+// Each glyph breathes lighter->darker on a smooth sine loop (no per-icon
+// animation state: the tint is a pure function of the wall clock, and
+// hubFrame keeps frames coming while any indicator is live). The pill
+// widens 30px per indicator (see targetForFull); the clock column keeps
+// its width so the face never shifts when indicators come and go.
 fn activityStrip(self: *HubUi, state: *State, id_extra: usize) void {
     _ = self;
     const c = state.activity.counts();
     const n = c.total();
     if (n == 0) return;
-    _ = dvui.spacer(@src(), .{ .expand = .horizontal, .id_extra = id_extra });
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
         .background = false,
         .gravity_y = 0.5,
@@ -2296,8 +2292,11 @@ fn activityStrip(self: *HubUi, state: *State, id_extra: usize) void {
         .tag = "tophub_activity",
     });
     defer row.deinit();
+    // Sine pulse, 1.5s loop: lighten amount glides between -12 and +14
+    // instead of snapping, so the blink reads as a breathe.
     const ms: i64 = std.Io.Clock.real.now(state.io).toMilliseconds();
-    const bright = @mod(@divTrunc(ms, 500), 2) == 0;
+    const t_s = @as(f32, @floatFromInt(ms)) / 1000.0;
+    const amt = 1.0 + @sin(t_s * std.math.pi * 2.0 / 1.5) * 13.0;
     const glyph_px: f32 = 20;
     // Order on the strip: record, share, camera, mic, download. One slot
     // per live indicator (not per kind): two concurrent shares show two
@@ -2312,7 +2311,7 @@ fn activityStrip(self: *HubUi, state: *State, id_extra: usize) void {
             2, 3 => dvui.Color.blue,
             else => dvui.Color.gray,
         };
-        const tint = if (bright) base.lighten(14) else base.lighten(-12);
+        const tint = base.lighten(amt);
         var j: usize = 0;
         while (j < n_kind) : (j += 1) {
             const crisp: ?Icons.Crisp = switch (ki) {
