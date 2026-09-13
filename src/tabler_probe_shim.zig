@@ -27,6 +27,23 @@ pub const Outline = enum {
     player_pause,
     player_skip_back,
     player_skip_forward,
+    // Activity / status indicators (see tabler_shim.zig).
+    player_record,
+    screen_share,
+    camera,
+    microphone,
+    download,
+    alert_small,
+    bell,
+    globe,
+    globe_off,
+    battery,
+    battery_1,
+    battery_2,
+    battery_3,
+    battery_4,
+    battery_charging,
+    battery_charging_2,
 };
 
 pub const Filled = enum {

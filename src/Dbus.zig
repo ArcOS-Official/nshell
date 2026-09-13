@@ -225,6 +225,13 @@ pub const Reply = struct {
         return v;
     }
 
+    pub fn readF64(self: *Reply) ?f64 {
+        if (testing) return null;
+        var v: f64 = 0;
+        if (c.sd_bus_message_read_basic(self.m, 'd', &v) <= 0) return null;
+        return v;
+    }
+
     pub fn readI64(self: *Reply) ?i64 {
         if (testing) return null;
         var v: i64 = 0;

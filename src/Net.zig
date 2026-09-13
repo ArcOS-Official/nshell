@@ -276,12 +276,32 @@ pub const Snapshot = struct {
 pub const Status = struct {
     present: bool = false,
     wifi_on: bool = false,
-    level: u8 = 0,
+    // Active AP signal, 0-100 percent (mirrors Ap.strength; 0 = none or
+    // unknown). Render bars via barsForStrength, never switch on this
+    // directly (see the bar indicator in main.zig).
+    strength: u8 = 0,
+    // Associated with an access point (a router is on the other end),
+    // whether or not it routes to the internet (see connectivity_full).
+    connected: bool = false,
+    // Last NetworkManager Connectivity state (see connectivity_full).
+    connectivity: u32 = 0,
     eth_up: bool = false,
+    // Bluetooth adapter present at all (gates the bar indicator).
+    bt_present: bool = false,
     bt_powered: bool = false,
     down_bps: f64 = 0,
     up_bps: f64 = 0,
 };
+
+// NetworkManager Connectivity state (libnm NMConnectivityState):
+// 0 unknown, 1 none, 2 portal, 3 limited, 4 full. Only FULL means usable
+// internet; anything less with a link up is "connected, no internet".
+pub const connectivity_full: u32 = 4;
+
+/// True when the link actually routes to the internet.
+pub fn online(connectivity: u32) bool {
+    return connectivity == connectivity_full;
+}
 
 mu: std.Io.Mutex = .init,
 alloc: std.mem.Allocator = undefined,
@@ -560,10 +580,11 @@ pub fn status(self: *Net) Status {
     if (!self.inited) return .{};
     self.mu.lockUncancelable(self.io);
     defer self.mu.unlock(self.io);
-    var st = Status{ .present = self.bus != null, .wifi_on = self.wifi_on, .bt_powered = self.bt_powered };
+    var st = Status{ .present = self.bus != null, .wifi_on = self.wifi_on, .bt_present = self.bt_present, .bt_powered = self.bt_powered, .connectivity = self.connectivity };
     for (self.aps.items) |*a| {
         if (a.active) {
-            st.level = a.strength;
+            st.strength = a.strength;
+            st.connected = true;
             break;
         }
     }
@@ -2187,8 +2208,12 @@ test "net: snapshot copies model and status aggregates" {
         .active = true,
     });
     net.wifi_on = true;
+    net.connectivity = connectivity_full;
     const st = net.status();
-    try std.testing.expectEqual(@as(u8, 80), st.level);
+    try std.testing.expectEqual(@as(u8, 80), st.strength);
+    try std.testing.expect(st.connected);
+    try std.testing.expect(online(st.connectivity));
+    try std.testing.expect(!online(1));
     try std.testing.expectEqual(@as(f64, 1000), st.down_bps);
     try std.testing.expectEqual(@as(f64, 500), st.up_bps);
     try std.testing.expect(!st.eth_up);

@@ -321,6 +321,59 @@ pub fn build(b: *std.Build) void {
     test_media_step.dependOn(&run_media_tests.step);
     test_state_step.dependOn(&run_media_tests.step);
 
+    // Activity unit tests (src/Activity.zig). Needs the nilebank import for
+    // the compositor capture-session types; PipeWire/download polling only
+    // runs in the worker, so the pure classification tests need no system.
+    const activity_test_module = b.createModule(.{
+        .root_source_file = b.path("src/Activity.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    activity_test_module.addImport("nilebank", nilebank_dep.module("nilebank"));
+    const activity_tests = b.addTest(.{
+        .root_module = activity_test_module,
+        .use_llvm = llvm,
+        .use_lld = lld,
+    });
+    const run_activity_tests = b.addRunArtifact(activity_tests);
+    const test_activity_step = b.step("test-activity", "Run Activity unit tests (no GUI, no bus)");
+    test_activity_step.dependOn(&run_activity_tests.step);
+    test_state_step.dependOn(&run_activity_tests.step);
+
+    // Power unit tests (src/Power.zig). Same shape as Net: needs the sd_bus
+    // import via Dbus.zig, stubbed in test builds, so no live bus is needed.
+    const power_test_module = b.createModule(.{
+        .root_source_file = b.path("src/Power.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    power_test_module.addImport("sd_bus", sd_bus_mod);
+    const power_tests = b.addTest(.{
+        .root_module = power_test_module,
+        .use_llvm = llvm,
+        .use_lld = lld,
+    });
+    const run_power_tests = b.addRunArtifact(power_tests);
+    const test_power_step = b.step("test-power", "Run Power unit tests (no GUI, no bus)");
+    test_power_step.dependOn(&run_power_tests.step);
+    test_state_step.dependOn(&run_power_tests.step);
+
+    // Notif unit tests (src/Notif.zig). Dependency-free stub.
+    const notif_test_module = b.createModule(.{
+        .root_source_file = b.path("src/Notif.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const notif_tests = b.addTest(.{
+        .root_module = notif_test_module,
+        .use_llvm = llvm,
+        .use_lld = lld,
+    });
+    const run_notif_tests = b.addRunArtifact(notif_tests);
+    const test_notif_step = b.step("test-notif", "Run Notif unit tests (no GUI)");
+    test_notif_step.dependOn(&run_notif_tests.step);
+    test_state_step.dependOn(&run_notif_tests.step);
+
     // Aliased-icon helper tests (src/Icons.zig). Only the pure threshold
     // helper is exercised: iconPx needs a window, which the headless
     // builds don't have (tabler resolves to the stub, dvui to the shim).

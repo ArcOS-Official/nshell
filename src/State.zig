@@ -5,6 +5,9 @@ const proto = nilebank.protocols.compositor;
 const Launcher = @import("Launcher.zig");
 pub const Net = @import("Net.zig");
 pub const Media = @import("Media.zig");
+pub const Activity = @import("Activity.zig");
+pub const Power = @import("Power.zig");
+pub const Notif = @import("Notif.zig");
 
 const State = @This();
 
@@ -53,6 +56,13 @@ pub const Action = union(enum) {
     // Ask the compositor for keyboard focus on the hub layer surface
     // (shell_namespace, filled in by the worker). No payload: plain data.
     request_keyboard_focus: void,
+    // Ask the compositor for its live screen-capture sessions (polled on
+    // Activity's cadence; pushes also arrive between polls).
+    query_capture_sessions: void,
+    // Tear down one compositor capture session (control-center Stop).
+    revoke_capture_session: RevokeCapture,
+
+    pub const RevokeCapture = struct { id: u64 };
 
     pub const CaptureWindow = struct {
         id: u64,
@@ -166,6 +176,14 @@ net: Net = .{},
 
 media: Media = .{},
 
+activity: Activity = .{},
+
+power: Power = .{},
+
+// Unread notification count (stub: no daemon feed yet, see Notif.zig).
+// UI-thread only for now.
+notif: Notif = .{},
+
 // Capture backoff (boot-ms timestamp; 0 = no backoff). The server may
 // answer capture_* with error code 3 when it can't serve a frame right now
 // ("capture not implemented" on old servers, or transient busy/not-ready on
@@ -240,6 +258,9 @@ pub fn initWithWakeup(
     self.launcher.init(alloc, io);
     self.net.init(alloc, io);
     self.media.init(alloc, io);
+    self.activity.init(alloc, io);
+    self.power.init(alloc, io);
+    self.notif = .{};
     self.inited.store(true, .seq_cst);
 }
 
@@ -273,6 +294,8 @@ pub fn deinit(self: *State) void {
     self.launcher.deinit();
     self.net.deinit();
     self.media.deinit();
+    self.activity.deinit();
+    self.power.deinit();
 }
 
 // UI -> worker: just enqueue; the worker sends on its own connection.
@@ -504,6 +527,31 @@ pub fn worker(self: *State, io: std.Io) void {
             break :blk false;
         };
         if (media_changed) self.requestRefresh();
+        const activity_changed = self.activity.tick() catch |e| blk: {
+            std.log.err("Activity error {s}", .{@errorName(e)});
+            break :blk false;
+        };
+        if (activity_changed) self.requestRefresh();
+        // The capture list lives behind this worker's own compositor
+        // connection: queue a query when Activity's cadence says so.
+        if (self.activity.captureQueryDue(self.nowMs())) {
+            self.req_q.push(self.alloc, self.io, .query_capture_sessions);
+        }
+        // Drain control-center stop requests: compositor ids become
+        // revoke actions below, PipeWire nodes are destroyed in place.
+        var stops: std.ArrayList(Activity.StopCmd) = .empty;
+        defer stops.deinit(self.alloc);
+        self.activity.takeStops(&stops);
+        for (stops.items) |s| switch (s.source) {
+            .compositor => self.req_q.push(self.alloc, self.io, .{ .revoke_capture_session = .{ .id = s.stop_id } }),
+            .pipewire => self.activity.destroyPipewireNode(s.stop_id),
+            .downloads => {},
+        };
+        const power_changed = self.power.tick() catch |e| blk: {
+            std.log.err("Power error {s}", .{@errorName(e)});
+            break :blk false;
+        };
+        if (power_changed) self.requestRefresh();
         const conn = self.ensureConn(io, &next_connect_ms) orelse {
             io.sleep(.fromMilliseconds(200), .awake) catch return;
             continue;
@@ -770,6 +818,17 @@ fn handleAction(self: *State, conn: *nilebank.Connection, a: *Action) !void {
         },
         .request_keyboard_focus => {
             var ev = try conn.requestCompositor(.{ .request_keyboard_focus = .{ .namespace = shell_namespace } }, .raw);
+            defer ev.deinit(self.alloc);
+        },
+        .query_capture_sessions => {
+            const ev = try conn.requestCompositor(.{ .list_capture_sessions = {} }, .raw);
+            self.commitEvent(ev);
+            self.requestRefresh();
+        },
+        .revoke_capture_session => |v| {
+            // Acked with pong; the teardown arrives as a
+            // capture_session_stopped push (or the next poll reconciles).
+            var ev = try conn.requestCompositor(.{ .revoke_capture_session = .{ .id = v.id } }, .raw);
             defer ev.deinit(self.alloc);
         },
     }
@@ -1104,6 +1163,15 @@ fn applyEvent(self: *State, ev: *proto.Event) void {
         // the window switcher. hubFrame owns its own simple hub_* var
         // (like hub_keyboard_focused) if it wants local switcher state.
         .launcher_opened, .launcher_closed => {},
+        // Screen-capture sessions feed Activity (hub indicators): the
+        // polled list is adopted wholesale (strings stolen, like the
+        // windows_snapshot path above); pushes merge incrementally.
+        .capture_sessions => {
+            self.activity.adoptCaptureSessions(ev.capture_sessions.items);
+            ev.capture_sessions.items = &.{};
+        },
+        .capture_session_started => |v| self.activity.upsertCaptureSession(v.id, v.pid, v.exe, v.app_id, v.kind),
+        .capture_session_stopped => |v| self.activity.removeCaptureSession(v.id),
         else => {},
     }
 }
