@@ -1299,7 +1299,8 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
                         if ((if (nt == .wifi)
                             Icons.iconPx(.wifi, 24, tab_ink)
                         else
-                            Icons.iconPx(.bluetooth, 24, tab_ink)) catch null) |crisp| {
+                            Icons.iconPx(.bluetooth, 24, tab_ink)) catch null) |crisp|
+                        {
                             _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
                                 .gravity_y = 0.5,
                                 .min_size_content = .{ .w = 24, .h = 24 },
@@ -1349,7 +1350,8 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
                     if ((if (self.net_tab == .wifi)
                         Icons.iconPx(.wifi, 36, pwr_ink)
                     else
-                        Icons.iconPx(.bluetooth, 36, pwr_ink)) catch null) |crisp| {
+                        Icons.iconPx(.bluetooth, 36, pwr_ink)) catch null) |crisp|
+                    {
                         _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
                             .gravity_x = 0.5,
                             .gravity_y = 0.5,
@@ -1447,391 +1449,391 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
                     // historical indent; bluetooth device rows follow in
                     // the else.
                     if (self.net_tab == .wifi) {
-                    for (snap.aps) |conn| {
-                        const selected = if (self.net_sel) |s|
-                            (s == conn.id)
-                        else
-                            (snap.connected == conn.id);
-                        const open = selected and self.net_sel_open;
-                        // Highlight marks the joined network only, dimmed
-                        // 10%; everything else is the plain content fill
-                        // with standard hover/press offsets.
-                        const is_connected = snap.connected != 0 and snap.connected == conn.id;
-                        const base_fill = if (is_connected)
-                            t.color(.highlight, .fill).lighten(-10)
-                        else
-                            t.color(.content, .fill);
-                        // In-flight request for this row (drives spinner,
-                        // button state; settled at the branch top).
-                        const connecting = self.net_req != null and self.net_req_ap == conn.id and
-                            self.net_req.?.isPending(&state.net);
-                        // The row auto-sizes around its content. While the
-                        // resize animation runs for this row, pin to the
-                        // animated height instead (height only: pinning the
-                        // width blows out the scroll content extents and the
-                        // rows jump horizontally for the whole animation).
-                        // The error banner below lives inside this box and
-                        // adds a line past the 72px open budget, so an
-                        // erroring row is never pinned (it would clip).
-                        const show_err = open and self.net_req == null and self.net_req_ap == conn.id and
-                            snap.last_error.len > 0 and now -% self.net_err_since < 5000;
-                        net_busy = net_busy or connecting;
-                        net_err_visible = net_err_visible or show_err;
-                        const anim_live = now -% self.net_anim_start < net_anim_ms;
-                        const anim_mine = anim_live and !show_err and (if (open)
-                            self.net_anim_open_ap == null or conn.id != self.net_anim_open_ap.?
-                        else
-                            self.net_anim_open_ap != null and conn.id == self.net_anim_open_ap.?);
-                        var bopts: dvui.Options = .{
-                            .background = true,
-                            .color_fill = base_fill,
-                            .color_fill_hover = base_fill.lighten(10),
-                            .color_fill_press = base_fill.lighten(-5),
-                            .corners = .all(10),
-                            .expand = .horizontal,
-                            // Rect fields are left/top/right/bottom.
-                            .padding = .{ .x = 4, .y = 6, .w = 4, .h = 6 },
-                            // Stable per-connection id (not the loop index):
-                            // the list re-sorts as strengths change, and
-                            // index-keyed widget ids make per-widget data
-                            // (including the password buffer) jump rows.
-                            .id_extra = @as(usize, @truncate(conn.id)),
-                        };
-                        if (anim_mine) {
-                            const ah = self.netRowHeight(conn.id, open, now);
-                            bopts.min_size_content = .{ .h = ah };
-                            bopts.max_size_content = dvui.Options.MaxSize.height(ah);
-                        }
-                        const box = dvui.box(@src(), .{ .dir = .vertical }, bopts);
-                        defer box.deinit();
-                        // Header: wifi + text lined up on the left, lock hard
-                        // right. Identical in both states so expanding never
-                        // moves it. The signal glyph sits on the bottom edge
-                        // (row1 is taller than the glyphs) so weaker signals
-                        // read as lower, not just smaller.
-                        {
-                            var row1 = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                        for (snap.aps) |conn| {
+                            const selected = if (self.net_sel) |s|
+                                (s == conn.id)
+                            else
+                                (snap.connected == conn.id);
+                            const open = selected and self.net_sel_open;
+                            // Highlight marks the joined network only, dimmed
+                            // 10%; everything else is the plain content fill
+                            // with standard hover/press offsets.
+                            const is_connected = snap.connected != 0 and snap.connected == conn.id;
+                            const base_fill = if (is_connected)
+                                t.color(.highlight, .fill).lighten(-10)
+                            else
+                                t.color(.content, .fill);
+                            // In-flight request for this row (drives spinner,
+                            // button state; settled at the branch top).
+                            const connecting = self.net_req != null and self.net_req_ap == conn.id and
+                                self.net_req.?.isPending(&state.net);
+                            // The row auto-sizes around its content. While the
+                            // resize animation runs for this row, pin to the
+                            // animated height instead (height only: pinning the
+                            // width blows out the scroll content extents and the
+                            // rows jump horizontally for the whole animation).
+                            // The error banner below lives inside this box and
+                            // adds a line past the 72px open budget, so an
+                            // erroring row is never pinned (it would clip).
+                            const show_err = open and self.net_req == null and self.net_req_ap == conn.id and
+                                snap.last_error.len > 0 and now -% self.net_err_since < 5000;
+                            net_busy = net_busy or connecting;
+                            net_err_visible = net_err_visible or show_err;
+                            const anim_live = now -% self.net_anim_start < net_anim_ms;
+                            const anim_mine = anim_live and !show_err and (if (open)
+                                self.net_anim_open_ap == null or conn.id != self.net_anim_open_ap.?
+                            else
+                                self.net_anim_open_ap != null and conn.id == self.net_anim_open_ap.?);
+                            var bopts: dvui.Options = .{
+                                .background = true,
+                                .color_fill = base_fill,
+                                .color_fill_hover = base_fill.lighten(10),
+                                .color_fill_press = base_fill.lighten(-5),
+                                .corners = .all(10),
                                 .expand = .horizontal,
-                                .background = false,
-                                .min_size_content = .{ .h = 32 },
+                                // Rect fields are left/top/right/bottom.
+                                .padding = .{ .x = 4, .y = 6, .w = 4, .h = 6 },
+                                // Stable per-connection id (not the loop index):
+                                // the list re-sorts as strengths change, and
+                                // index-keyed widget ids make per-widget data
+                                // (including the password buffer) jump rows.
                                 .id_extra = @as(usize, @truncate(conn.id)),
-                            });
-                            defer row1.deinit();
-                            // One comptime call per icon (tabler embeds only
-                            // referenced icons). Aliased 1-bit raster, shown 1:1.
-                            const sig_crisp: ?Icons.Crisp = switch (State.Net.barsForStrength(conn.strength)) {
-                                0 => Icons.iconPx(.wifi_off, 24, .white) catch null,
-                                1 => Icons.iconPx(.wifi_0, 24, .white) catch null,
-                                2 => Icons.iconPx(.wifi_1, 24, .white) catch null,
-                                3 => Icons.iconPx(.wifi_2, 24, .white) catch null,
-                                else => Icons.iconPx(.wifi, 24, .white) catch null,
                             };
-                            if (sig_crisp) |crisp| {
-                                _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
-                                    .padding = .all(2),
-                                    .gravity_y = 1.0,
-                                });
+                            if (anim_mine) {
+                                const ah = self.netRowHeight(conn.id, open, now);
+                                bopts.min_size_content = .{ .h = ah };
+                                bopts.max_size_content = dvui.Options.MaxSize.height(ah);
                             }
-                            // NOTE: no align_y — single-line labels render at
-                            // the top of their content rect (LabelWidget
-                            // places only horizontally), so vertical
-                            // centering comes from the widget's own gravity
-                            // + symmetric padding. Horizontal-only expand
-                            // keeps the content box text-sized (and pushes
-                            // the lock right); .both would stretch it full
-                            // height and strand the text at the top.
-                            dvui.labelNoFmt(@src(), conn.ssid, .{}, .{
-                                .expand = .horizontal,
-                                .padding = .all(4),
-                                .gravity_y = 0.5,
-                            });
-                            //macOS-style activity spinner while this row has
-                            // a request in flight. Drawn manually (dvui's
-                            // stock spinner is an arc, not spokes).
-                            if (connecting) {
-                                var slot = dvui.box(@src(), .{}, .{
-                                    .background = false,
-                                    .min_size_content = .{ .w = 24, .h = 24 },
-                                    .max_size_content = .{ .w = 24, .h = 24 },
-                                    .padding = .all(2),
-                                    .gravity_y = 0.5,
-                                    .id_extra = @as(usize, @truncate(conn.id)),
-                                });
-                                defer slot.deinit();
-                                drawSpinner(slot.data().contentRectScale(), now, t.color(.content, .text));
-                            }
-                            // Same 2px padding as the signal icon so the
-                            // text sits equidistant from both glyphs.
-                            if (conn.secured) {
-                                if (Icons.iconPxFilled(.lock, 24, .white) catch null) |crisp| {
-                                    _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
-                                        .padding = .all(2),
-                                        .gravity_y = 0.5,
-                                    });
-                                }
-                            } else {
-                                if (Icons.iconPx(.lock_cancel, 24, .white) catch null) |crisp| {
-                                    _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
-                                        .padding = .all(2),
-                                        .gravity_y = 0.5,
-                                    });
-                                }
-                            }
-                        }
-                        // Interactive child rects, for the whole-row toggle
-                        // veto below. Physical units, matching the click
-                        // position. Captured before their widgets deinit.
-                        // The button vetoes via its own click state.
-                        var veto_entry: ?dvui.Rect.Physical = null;
-                        var veto_err: ?dvui.Rect.Physical = null;
-                        var btn_clicked = false;
-                        if (open) {
-                            // Joined to this network: offer Disconnect.
-                            // Otherwise Connect — activating a new
-                            // connection swaps out whatever is active on
-                            // the device, no manual disconnect needed.
-                            const joined_here = is_connected;
-                            // Controls row. No background wash while typing:
-                            // the entry's own focus outline is the only
-                            // focus indicator (the old highlight fill made
-                            // the whole row turn the theme highlight color).
-                            var row2 = dvui.box(@src(), .{ .dir = .horizontal }, .{
-                                .expand = .horizontal,
-                                .background = false,
-                                .id_extra = @as(usize, @truncate(conn.id)),
-                                .tag = "pw_row",
-                            });
-                            defer row2.deinit();
-                            // Entry outlives the row: its buffer backs `pw`
-                            // through the Connect click below.
-                            var pw: []const u8 = "";
-                            // Saved-profile state: a stored NM password
-                            // exists and the user hasn't typed an
-                            // override. Entry grays out ("Password saved
-                            // — click Connect"); Connect activates the
-                            // stored profile. Any typed text overrides.
-                            const reject_ap = self.net_reject_ap;
-                            const reject_live = reject_ap == conn.id and
-                                now -% self.net_reject_since < net_reject_ms and
-                                self.net_reject_since != 0;
-                            if (reject_live) std.debug.print("reject_live row {d} el={d}\n", .{ conn.id, now -% self.net_reject_since });
-                            if (conn.secured and !joined_here) {
-                                const use_saved = conn.saved;
-                                var eopts: dvui.Options = .{
+                            const box = dvui.box(@src(), .{ .dir = .vertical }, bopts);
+                            defer box.deinit();
+                            // Header: wifi + text lined up on the left, lock hard
+                            // right. Identical in both states so expanding never
+                            // moves it. The signal glyph sits on the bottom edge
+                            // (row1 is taller than the glyphs) so weaker signals
+                            // read as lower, not just smaller.
+                            {
+                                var row1 = dvui.box(@src(), .{ .dir = .horizontal }, .{
                                     .expand = .horizontal,
-                                    .gravity_y = 0.5,
-                                    .font = t.font_body.withSize(11.0),
-                                    // Uncap the single-line width clamp
-                                    // (min 14 M-widths) so the entry truly
-                                    // fills its flex share. min h 14 lands
-                                    // the entry on the 28px control budget
-                                    // (14 content + 12 padding + 2 border),
-                                    // matching the button below so the open
-                                    // row measures exactly net_row_open_h.
-                                    // No vertical margin: the default all(4)
-                                    // would pad the row height; 8px right
-                                    // keeps it off the button.
-                                    .min_size_content = .{ .h = 14 },
-                                    .max_size_content = .{ .w = 100000, .h = 14 },
-                                    .margin = .{ .x = 0, .y = 0, .w = 8, .h = 0 },
+                                    .background = false,
+                                    .min_size_content = .{ .h = 32 },
                                     .id_extra = @as(usize, @truncate(conn.id)),
-                                    .tag = "pw_entry",
+                                });
+                                defer row1.deinit();
+                                // One comptime call per icon (tabler embeds only
+                                // referenced icons). Aliased 1-bit raster, shown 1:1.
+                                const sig_crisp: ?Icons.Crisp = switch (State.Net.barsForStrength(conn.strength)) {
+                                    0 => Icons.iconPx(.wifi_off, 24, .white) catch null,
+                                    1 => Icons.iconPx(.wifi_0, 24, .white) catch null,
+                                    2 => Icons.iconPx(.wifi_1, 24, .white) catch null,
+                                    3 => Icons.iconPx(.wifi_2, 24, .white) catch null,
+                                    else => Icons.iconPx(.wifi, 24, .white) catch null,
                                 };
-                                if (use_saved) {
-                                    // Grayed look: dimmed chrome and text.
-                                    // Still interactive — typing an
-                                    // override switches the row back to
-                                    // the typed-password connect path.
-                                    eopts = eopts.override(.{
-                                        .color_fill = t.color(.content, .fill).opacity(0.45),
-                                        .color_border = t.color(.content, .text).opacity(0.2),
-                                        .color_text = t.color(.content, .text).opacity(0.55),
+                                if (sig_crisp) |crisp| {
+                                    _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+                                        .padding = .all(2),
+                                        .gravity_y = 1.0,
                                     });
                                 }
-                                if (reject_live) {
-                                    // Wrong-password wiggle: the left
-                                    // margin follows a decaying sine
-                                    // (always >= 0: box margins can't go
-                                    // negative), so entry+button glide
-                                    // together within the row's own width
-                                    // and the flex share is preserved.
-                                    const el = @as(f32, @floatFromInt(now -% self.net_reject_since));
-                                    const frac = el / @as(f32, @floatFromInt(net_reject_ms));
-                                    const decay = 1.0 - frac;
-                                    const dx = (@sin(frac * std.math.pi * 6.0) + 1.0) * 5.0 * decay;
-                                    eopts = eopts.override(.{
-                                        .margin = .{ .x = dx, .y = 0, .w = 8, .h = 0 },
+                                // NOTE: no align_y — single-line labels render at
+                                // the top of their content rect (LabelWidget
+                                // places only horizontally), so vertical
+                                // centering comes from the widget's own gravity
+                                // + symmetric padding. Horizontal-only expand
+                                // keeps the content box text-sized (and pushes
+                                // the lock right); .both would stretch it full
+                                // height and strand the text at the top.
+                                dvui.labelNoFmt(@src(), conn.ssid, .{}, .{
+                                    .expand = .horizontal,
+                                    .padding = .all(4),
+                                    .gravity_y = 0.5,
+                                });
+                                //macOS-style activity spinner while this row has
+                                // a request in flight. Drawn manually (dvui's
+                                // stock spinner is an arc, not spokes).
+                                if (connecting) {
+                                    var slot = dvui.box(@src(), .{}, .{
+                                        .background = false,
+                                        .min_size_content = .{ .w = 24, .h = 24 },
+                                        .max_size_content = .{ .w = 24, .h = 24 },
+                                        .padding = .all(2),
+                                        .gravity_y = 0.5,
+                                        .id_extra = @as(usize, @truncate(conn.id)),
                                     });
+                                    defer slot.deinit();
+                                    drawSpinner(slot.data().contentRectScale(), now, t.color(.content, .text));
                                 }
-                                const e = dvui.textEntry(@src(), .{
-                                    .placeholder = if (use_saved)
-                                        "Password saved — click Connect"
-                                    else
-                                        "Password",
-                                    .password_char = "*",
-                                }, eopts);
-                                pw = e.getText();
-                                veto_entry = e.data().borderRectScale().r;
-                                // Enter submits like the button. The flag
-                                // latches until read, so always clear it.
-                                const enter_go = e.enter_pressed;
-                                e.enter_pressed = false;
-                                // Deinit BEFORE creating the Connect button:
-                                // the entry's init leaves dvui's current
-                                // parent at its internal textLayout, so any
-                                // widget created before deinit becomes a
-                                // child of the entry and renders on top of
-                                // the password text (the "goofy" overlap).
-                                // getText's buffer stays valid after
-                                // deinit; pw was already copied above.
-                                const pw_owned = pw;
-                                const entry_rect = e.data().borderRectScale();
-                                const entry_focused = dvui.focusedWidgetId() == e.data().id;
-                                e.deinit();
-                                pw = pw_owned;
-                                // Reject window: draw the red focus outline
-                                // over the stock one (same 2px), tied to
-                                // focus like the stock border so it reads
-                                // as the entry's outline, not a decal.
-                                if (reject_live and entry_focused) {
-                                    entry_rect.r.stroke(dvui.CornerRect.Physical.all(4 * entry_rect.s), .{
-                                        .thickness = 2 * entry_rect.s,
-                                        .color = .{ .r = 0xcc, .g = 0x2e, .b = 0x2e, .a = 255 },
-                                        .after = true,
-                                    });
+                                // Same 2px padding as the signal icon so the
+                                // text sits equidistant from both glyphs.
+                                if (conn.secured) {
+                                    if (Icons.iconPxFilled(.lock, 24, .white) catch null) |crisp| {
+                                        _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+                                            .padding = .all(2),
+                                            .gravity_y = 0.5,
+                                        });
+                                    }
+                                } else {
+                                    if (Icons.iconPx(.lock_cancel, 24, .white) catch null) |crisp| {
+                                        _ = dvui.image(@src(), Icons.pixelImage(crisp), .{
+                                            .padding = .all(2),
+                                            .gravity_y = 0.5,
+                                        });
+                                    }
                                 }
-                                if (enter_go and !connecting) {
-                                    if (pw.len > 0) {
+                            }
+                            // Interactive child rects, for the whole-row toggle
+                            // veto below. Physical units, matching the click
+                            // position. Captured before their widgets deinit.
+                            // The button vetoes via its own click state.
+                            var veto_entry: ?dvui.Rect.Physical = null;
+                            var veto_err: ?dvui.Rect.Physical = null;
+                            var btn_clicked = false;
+                            if (open) {
+                                // Joined to this network: offer Disconnect.
+                                // Otherwise Connect — activating a new
+                                // connection swaps out whatever is active on
+                                // the device, no manual disconnect needed.
+                                const joined_here = is_connected;
+                                // Controls row. No background wash while typing:
+                                // the entry's own focus outline is the only
+                                // focus indicator (the old highlight fill made
+                                // the whole row turn the theme highlight color).
+                                var row2 = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                                    .expand = .horizontal,
+                                    .background = false,
+                                    .id_extra = @as(usize, @truncate(conn.id)),
+                                    .tag = "pw_row",
+                                });
+                                defer row2.deinit();
+                                // Entry outlives the row: its buffer backs `pw`
+                                // through the Connect click below.
+                                var pw: []const u8 = "";
+                                // Saved-profile state: a stored NM password
+                                // exists and the user hasn't typed an
+                                // override. Entry grays out ("Password saved
+                                // — click Connect"); Connect activates the
+                                // stored profile. Any typed text overrides.
+                                const reject_ap = self.net_reject_ap;
+                                const reject_live = reject_ap == conn.id and
+                                    now -% self.net_reject_since < net_reject_ms and
+                                    self.net_reject_since != 0;
+                                if (reject_live) std.debug.print("reject_live row {d} el={d}\n", .{ conn.id, now -% self.net_reject_since });
+                                if (conn.secured and !joined_here) {
+                                    const use_saved = conn.saved;
+                                    var eopts: dvui.Options = .{
+                                        .expand = .horizontal,
+                                        .gravity_y = 0.5,
+                                        .font = t.font_body.withSize(11.0),
+                                        // Uncap the single-line width clamp
+                                        // (min 14 M-widths) so the entry truly
+                                        // fills its flex share. min h 14 lands
+                                        // the entry on the 28px control budget
+                                        // (14 content + 12 padding + 2 border),
+                                        // matching the button below so the open
+                                        // row measures exactly net_row_open_h.
+                                        // No vertical margin: the default all(4)
+                                        // would pad the row height; 8px right
+                                        // keeps it off the button.
+                                        .min_size_content = .{ .h = 14 },
+                                        .max_size_content = .{ .w = 100000, .h = 14 },
+                                        .margin = .{ .x = 0, .y = 0, .w = 8, .h = 0 },
+                                        .id_extra = @as(usize, @truncate(conn.id)),
+                                        .tag = "pw_entry",
+                                    };
+                                    if (use_saved) {
+                                        // Grayed look: dimmed chrome and text.
+                                        // Still interactive — typing an
+                                        // override switches the row back to
+                                        // the typed-password connect path.
+                                        eopts = eopts.override(.{
+                                            .color_fill = t.color(.content, .fill).opacity(0.45),
+                                            .color_border = t.color(.content, .text).opacity(0.2),
+                                            .color_text = t.color(.content, .text).opacity(0.55),
+                                        });
+                                    }
+                                    if (reject_live) {
+                                        // Wrong-password wiggle: the left
+                                        // margin follows a decaying sine
+                                        // (always >= 0: box margins can't go
+                                        // negative), so entry+button glide
+                                        // together within the row's own width
+                                        // and the flex share is preserved.
+                                        const el = @as(f32, @floatFromInt(now -% self.net_reject_since));
+                                        const frac = el / @as(f32, @floatFromInt(net_reject_ms));
+                                        const decay = 1.0 - frac;
+                                        const dx = (@sin(frac * std.math.pi * 6.0) + 1.0) * 5.0 * decay;
+                                        eopts = eopts.override(.{
+                                            .margin = .{ .x = dx, .y = 0, .w = 8, .h = 0 },
+                                        });
+                                    }
+                                    const e = dvui.textEntry(@src(), .{
+                                        .placeholder = if (use_saved)
+                                            "Password saved — click Connect"
+                                        else
+                                            "Password",
+                                        .password_char = "*",
+                                    }, eopts);
+                                    pw = e.getText();
+                                    veto_entry = e.data().borderRectScale().r;
+                                    // Enter submits like the button. The flag
+                                    // latches until read, so always clear it.
+                                    const enter_go = e.enter_pressed;
+                                    e.enter_pressed = false;
+                                    // Deinit BEFORE creating the Connect button:
+                                    // the entry's init leaves dvui's current
+                                    // parent at its internal textLayout, so any
+                                    // widget created before deinit becomes a
+                                    // child of the entry and renders on top of
+                                    // the password text (the "goofy" overlap).
+                                    // getText's buffer stays valid after
+                                    // deinit; pw was already copied above.
+                                    const pw_owned = pw;
+                                    const entry_rect = e.data().borderRectScale();
+                                    const entry_focused = dvui.focusedWidgetId() == e.data().id;
+                                    e.deinit();
+                                    pw = pw_owned;
+                                    // Reject window: draw the red focus outline
+                                    // over the stock one (same 2px), tied to
+                                    // focus like the stock border so it reads
+                                    // as the entry's outline, not a decal.
+                                    if (reject_live and entry_focused) {
+                                        entry_rect.r.stroke(dvui.CornerRect.Physical.all(4 * entry_rect.s), .{
+                                            .thickness = 2 * entry_rect.s,
+                                            .color = .{ .r = 0xcc, .g = 0x2e, .b = 0x2e, .a = 255 },
+                                            .after = true,
+                                        });
+                                    }
+                                    if (enter_go and !connecting) {
+                                        if (pw.len > 0) {
+                                            if (wifi_dev) |dev| self.connectToAp(state, dev, conn, pw);
+                                        } else if (use_saved) {
+                                            if (wifi_dev) |dev| self.connectToApSaved(state, dev, conn);
+                                        }
+                                    }
+                                } else {
+                                    _ = dvui.spacer(@src(), .{ .expand = .horizontal });
+                                }
+                                // While the request is in flight the button
+                                // itself reports it: grayed "Connecting…".
+                                // Standard button at the row end (right).
+                                const btn_label = if (connecting) "Connecting…" else if (joined_here) "Disconnect" else "Connect";
+                                // A secured network needs a passphrase unless
+                                // one is already stored (saved-profile path).
+                                const need_pw = conn.secured and !joined_here and pw.len == 0 and !conn.saved;
+                                btn_clicked = dvui.button(@src(), btn_label, .{ .grayed = need_pw or connecting }, .{
+                                    .gravity_y = 0.5,
+                                    // 24 content + 4 padding = the 28px control
+                                    // budget (see the password entry above): the
+                                    // open row then measures exactly
+                                    // net_row_open_h and the resize pin neither
+                                    // clips nor jumps at either end.
+                                    .min_size_content = .{ .h = 24 },
+                                    // Zero vertical chrome: the defaults
+                                    // (margin + padding all(4..6)) stack onto
+                                    // the label and bloat the row with dead
+                                    // space below the button.
+                                    .margin = .all(0),
+                                    .padding = .all(2),
+                                    .font = t.font_body.withSize(11.0),
+                                    .id_extra = @as(usize, @truncate(conn.id)),
+                                    .tag = "connect_btn",
+                                });
+                                // grayed is visual only: guard the in-flight
+                                // double-submit explicitly.
+                                if (btn_clicked and !connecting) {
+                                    if (joined_here) {
+                                        self.disconnectAp(state, conn);
+                                    } else if (pw.len > 0) {
+                                        // Typed text always overrides the
+                                        // stored secret.
                                         if (wifi_dev) |dev| self.connectToAp(state, dev, conn, pw);
-                                    } else if (use_saved) {
+                                    } else if (conn.saved) {
+                                        // Nothing typed + stored profile: let
+                                        // NM supply the saved password.
                                         if (wifi_dev) |dev| self.connectToApSaved(state, dev, conn);
                                     }
                                 }
-                            } else {
-                                _ = dvui.spacer(@src(), .{ .expand = .horizontal });
                             }
-                            // While the request is in flight the button
-                            // itself reports it: grayed "Connecting…".
-                            // Standard button at the row end (right).
-                            const btn_label = if (connecting) "Connecting…" else if (joined_here) "Disconnect" else "Connect";
-                            // A secured network needs a passphrase unless
-                            // one is already stored (saved-profile path).
-                            const need_pw = conn.secured and !joined_here and pw.len == 0 and !conn.saved;
-                            btn_clicked = dvui.button(@src(), btn_label, .{ .grayed = need_pw or connecting }, .{
-                                .gravity_y = 0.5,
-                                // 24 content + 4 padding = the 28px control
-                                // budget (see the password entry above): the
-                                // open row then measures exactly
-                                // net_row_open_h and the resize pin neither
-                                // clips nor jumps at either end.
-                                .min_size_content = .{ .h = 24 },
-                                // Zero vertical chrome: the defaults
-                                // (margin + padding all(4..6)) stack onto
-                                // the label and bloat the row with dead
-                                // space below the button.
-                                .margin = .all(0),
-                                .padding = .all(2),
-                                .font = t.font_body.withSize(11.0),
-                                .id_extra = @as(usize, @truncate(conn.id)),
-                                .tag = "connect_btn",
-                            });
-                            // grayed is visual only: guard the in-flight
-                            // double-submit explicitly.
-                            if (btn_clicked and !connecting) {
-                                if (joined_here) {
-                                    self.disconnectAp(state, conn);
-                                } else if (pw.len > 0) {
-                                    // Typed text always overrides the
-                                    // stored secret.
-                                    if (wifi_dev) |dev| self.connectToAp(state, dev, conn, pw);
-                                } else if (conn.saved) {
-                                    // Nothing typed + stored profile: let
-                                    // NM supply the saved password.
-                                    if (wifi_dev) |dev| self.connectToApSaved(state, dev, conn);
-                                }
-                            }
-                        }
-                        // Error for this row's failed request, on its own
-                        // line below the controls. Flashes red twice (10
-                        // frame periods: 5 red, 5 transparent), then goes
-                        // unadorned; vanishes 5s after the failure unless
-                        // hovered (hover restarts the 5s), or at once on
-                        // click. Clicking it must not toggle the row.
-                        if (show_err) {
-                            self.net_err_frame += 1;
-                            var errbox = dvui.box(@src(), .{ .dir = .horizontal }, .{
-                                .expand = .horizontal,
-                                .background = true,
-                                .color_fill = if (errFlashRed(self.net_err_frame))
-                                    dvui.Color{ .r = 0xcc, .g = 0x2e, .b = 0x2e, .a = 255 }
-                                else
-                                    .transparent,
-                                .corners = .all(4),
-                                .padding = .all(4),
-                                .id_extra = @as(usize, @truncate(conn.id)),
-                            });
-                            defer errbox.deinit();
-                            var err_hover = false;
-                            const err_clicked = dvui.clicked(errbox.data(), .{ .hovered = &err_hover });
-                            if (err_hover) self.net_err_since = now;
-                            if (err_clicked) {
-                                self.net_req_ap = 0;
-                            } else {
-                                dvui.labelNoFmt(@src(), snap.last_error, .{}, .{
+                            // Error for this row's failed request, on its own
+                            // line below the controls. Flashes red twice (10
+                            // frame periods: 5 red, 5 transparent), then goes
+                            // unadorned; vanishes 5s after the failure unless
+                            // hovered (hover restarts the 5s), or at once on
+                            // click. Clicking it must not toggle the row.
+                            if (show_err) {
+                                self.net_err_frame += 1;
+                                var errbox = dvui.box(@src(), .{ .dir = .horizontal }, .{
                                     .expand = .horizontal,
-                                    .color_text = t.color(.content, .text).opacity(0.85),
-                                    .font = t.font_body.withSize(10.0),
+                                    .background = true,
+                                    .color_fill = if (errFlashRed(self.net_err_frame))
+                                        dvui.Color{ .r = 0xcc, .g = 0x2e, .b = 0x2e, .a = 255 }
+                                    else
+                                        .transparent,
+                                    .corners = .all(4),
+                                    .padding = .all(4),
+                                    .id_extra = @as(usize, @truncate(conn.id)),
                                 });
-                            }
-                            veto_err = errbox.data().borderRectScale().r;
-                        }
-                        // The whole row toggles — except clicks the button
-                        // took, and releases landing on the password entry
-                        // or error box, which belong to those widgets.
-                        // Keyboard activation carries no position and
-                        // always toggles.
-                        if (dvui.clickedEx(box.data(), .{})) |cev| {
-                            const on_child = btn_clicked or switch (cev) {
-                                .mouse => |me| blk: {
-                                    if (veto_entry) |r| {
-                                        if (r.contains(me.p)) break :blk true;
-                                    }
-                                    if (veto_err) |r| {
-                                        if (r.contains(me.p)) break :blk true;
-                                    }
-                                    break :blk false;
-                                },
-                                else => false,
-                            };
-                            if (!on_child) {
-                                // Restart the resize animation from the row
-                                // currently displayed open (if any), then
-                                // flip this row's state.
-                                self.net_anim_open_ap = if (self.net_sel_open) blk: {
-                                    if (self.net_sel) |s| break :blk s;
-                                    break :blk if (snap.connected != 0) snap.connected else null;
-                                } else null;
-                                self.net_anim_start = now;
-                                // Drive frames for the manual height lerp:
-                                // without a live dvui animation the loop
-                                // sleeps through the 135ms and both rows
-                                // snap instead of resizing.
-                                dvui.animation(self.anim_id, "netrow", .{
-                                    .easing = dvui.easing.outQuart,
-                                    .end_time = net_anim_ms * 1000,
-                                });
-                                // Select the connection (expand its row);
-                                // clicking the selected row collapses it.
-                                if (self.net_sel == conn.id) {
-                                    self.net_sel_open = !self.net_sel_open;
+                                defer errbox.deinit();
+                                var err_hover = false;
+                                const err_clicked = dvui.clicked(errbox.data(), .{ .hovered = &err_hover });
+                                if (err_hover) self.net_err_since = now;
+                                if (err_clicked) {
+                                    self.net_req_ap = 0;
                                 } else {
-                                    self.net_sel = conn.id;
-                                    self.net_sel_open = true;
+                                    dvui.labelNoFmt(@src(), snap.last_error, .{}, .{
+                                        .expand = .horizontal,
+                                        .color_text = t.color(.content, .text).opacity(0.85),
+                                        .font = t.font_body.withSize(10.0),
+                                    });
                                 }
-                                self.net_req_ap = 0;
+                                veto_err = errbox.data().borderRectScale().r;
+                            }
+                            // The whole row toggles — except clicks the button
+                            // took, and releases landing on the password entry
+                            // or error box, which belong to those widgets.
+                            // Keyboard activation carries no position and
+                            // always toggles.
+                            if (dvui.clickedEx(box.data(), .{})) |cev| {
+                                const on_child = btn_clicked or switch (cev) {
+                                    .mouse => |me| blk: {
+                                        if (veto_entry) |r| {
+                                            if (r.contains(me.p)) break :blk true;
+                                        }
+                                        if (veto_err) |r| {
+                                            if (r.contains(me.p)) break :blk true;
+                                        }
+                                        break :blk false;
+                                    },
+                                    else => false,
+                                };
+                                if (!on_child) {
+                                    // Restart the resize animation from the row
+                                    // currently displayed open (if any), then
+                                    // flip this row's state.
+                                    self.net_anim_open_ap = if (self.net_sel_open) blk: {
+                                        if (self.net_sel) |s| break :blk s;
+                                        break :blk if (snap.connected != 0) snap.connected else null;
+                                    } else null;
+                                    self.net_anim_start = now;
+                                    // Drive frames for the manual height lerp:
+                                    // without a live dvui animation the loop
+                                    // sleeps through the 135ms and both rows
+                                    // snap instead of resizing.
+                                    dvui.animation(self.anim_id, "netrow", .{
+                                        .easing = dvui.easing.outQuart,
+                                        .end_time = net_anim_ms * 1000,
+                                    });
+                                    // Select the connection (expand its row);
+                                    // clicking the selected row collapses it.
+                                    if (self.net_sel == conn.id) {
+                                        self.net_sel_open = !self.net_sel_open;
+                                    } else {
+                                        self.net_sel = conn.id;
+                                        self.net_sel_open = true;
+                                    }
+                                    self.net_req_ap = 0;
+                                }
                             }
                         }
-                    }
                     } else {
                         // Bluetooth tab: same card language as the wifi
                         // rows (icon + name left, status hard right),
@@ -1968,9 +1970,11 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
 
                 // 2 blocks here
                 for (0..2) |i| {
-                    // TODO: make sure bt_present is just wifi_on's counterpart
-                    // (aka it should mean bluetooth is on and listening)
-                    const on = if (i == 0) snap.wifi_on else snap.bt_present;
+                    // wifi_on tracks the wifi radio; its bluetooth
+                    // counterpart is bt_powered (BlueZ "Powered":
+                    // on and listening), not bt_present (which only
+                    // means an adapter exists).
+                    const on = if (i == 0) snap.wifi_on else snap.bt_powered;
                     // Fixed glyph box for both toggles: rasterized at the
                     // display size and shown 1:1, so wifi and bluetooth
                     // render at identical sizes (24 content + 12 badge
@@ -2138,7 +2142,7 @@ pub fn clockLabels(self: *HubUi, state: *State, t: *dvui.Theme, centered: bool) 
         },
     );
     const dw = [_][]const u8{
-        "Thursday", "Friday",  "Saturday", "Sunday",
+        "Thursday", "Friday",  "Saturday",  "Sunday",
         "Monday",   "Tuesday", "Wednesday",
     };
     const ms = [_][]const u8{
@@ -2201,12 +2205,12 @@ pub fn clockPlayer(self: *HubUi, state: *State, t: *dvui.Theme, snap: State.Medi
     // never shift (see targetForMedia's budget).
     {
         var tcol = dvui.box(@src(), .{ .dir = .vertical }, .{
-            .expand = .horizontal,
+            .expand = .both,
             .background = false,
             .gravity_y = 0.5,
             .max_size_content = dvui.Options.MaxSize.width(160),
             .id_extra = id_extra,
-            .padding = .fromSize(.{ .h = 12 }),
+            .padding = .{ .h = 6, .y = 6 },
         });
         defer tcol.deinit();
         var title_buf: [64]u8 = undefined;
@@ -2215,27 +2219,42 @@ pub fn clockPlayer(self: *HubUi, state: *State, t: *dvui.Theme, snap: State.Medi
             .align_x = 0.0,
             .align_y = 0.5,
         }, .{
-            .font = t.font_body.withSize(11.0),
+            .font = t.font_body.withSize(9.0),
             .id_extra = id_extra,
             .gravity_x = 0.0,
+            .padding = .all(2),
         });
-        dvui.progress(@src(), .{ .percent = snap.frac() }, .{
-            .expand = .horizontal,
-            // Explicit zero padding: progress_defaults force padding 2
-            // on all sides, and progress draws the fill in the CONTENT
-            // rect (size minus padding) — with the height pinned below,
-            // any padding eats the bar itself (a 4px pin + 2+2 padding =
-            // ~0px of visible fill). Zero padding makes the content rect
-            // equal the widget rect, so the pin below is the true
-            // thickness.
-            .padding = .all(0),
-            .min_size_content = .{ .h = 6 },
-            .max_size_content = dvui.Options.MaxSize.height(6),
-            .corners = .all(6),
-            .margin = .{ .y = 2 },
+        // Seek readout: interpolated position over track length
+        // (m:ss via State.Media.formatTime; unknown length shows 00:00).
+        var now_buf: [16]u8 = undefined;
+        var total_buf: [16]u8 = undefined;
+        const time_now = State.Media.formatTime(&now_buf, snap.position_us);
+        const time_total = State.Media.formatTime(&total_buf, snap.length_us);
+        dvui.label(@src(), "{s}/{s}", .{ time_now, time_total }, .{
             .id_extra = id_extra,
             .gravity_x = 0.0,
+            .color_text = t.color(.content, .text).opacity(40),
+            .font = t.font_body.withSize(7.0),
+            .padding = .all(2),
         });
+        //dvui.progress(@src(), .{ .percent = snap.frac() }, .{
+        //    .expand = .horizontal,
+        //    // Explicit zero padding: progress_defaults force padding 2
+        //    // on all sides, and progress draws the fill in the CONTENT
+        //    // rect (size minus padding) — with the height pinned below,
+        //    // any padding eats the bar itself (a 4px pin + 2+2 padding =
+        //    // ~0px of visible fill). Zero padding makes the content rect
+        //    // equal the widget rect, so the pin below is the true
+        //    // thickness.
+        //    .padding = .all(0),
+        //    .min_size_content = .{ .h = 6 },
+        //    .max_size_content = dvui.Options.MaxSize.height(6),
+        //    .corners = .all(6),
+        //    .margin = .{ .y = 2 },
+        //    .id_extra = id_extra,
+        //    .gravity_x = 0.0,
+        //    .gravity_y = 1.0,
+        //});
     }
     _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 6 } });
 

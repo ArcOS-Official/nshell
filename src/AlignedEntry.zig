@@ -365,8 +365,14 @@ pub fn init(self: *AlignedEntry, src: std.builtin.SourceLocation, init_opts: Ini
         AccessKit.nodeAddAction(ak_node, AccessKit.Action.set_value);
         AccessKit.nodeAddAction(ak_node, AccessKit.Action.set_text_selection);
         AccessKit.nodeAddAction(ak_node, AccessKit.Action.replace_selected_text);
-        AccessKit.nodeAddAction(ak_node, AccessKit.Action.scroll_into_view); // AK TODO - not yet implemented
-        AccessKit.nodeSetClipsChildren(ak_node); // AK TODO: Check this is correct?
+        // NOTE: mirrors upstream TextEntryWidget. dvui's AccessKit action
+        // handler for scroll_into_view is still a no-op, so this only
+        // advertises future behavior; re-check on the next dvui re-diff.
+        AccessKit.nodeAddAction(ak_node, AccessKit.Action.scroll_into_view);
+        // Correct: overflowing single-line text is clipped to the content
+        // box (see clipSet(borderClip) above), so children never paint
+        // outside this node's bounds.
+        AccessKit.nodeSetClipsChildren(ak_node);
 
         if (self.data().options.role != .password_input) {
             const str = self.text[0..self.len];
