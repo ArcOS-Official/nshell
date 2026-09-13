@@ -231,7 +231,7 @@ fn frame() !dvui.App.Result {
     // Scale knob for the bar: workspace numbers set the type size, and icon
     // glyphs render at the same size (see icon_px below).
     const num_font = t.font_mono.withWeight(.bold).withSize(11.0);
-    const icon_px: f32 = num_font.size*2;
+    const icon_px: f32 = num_font.size * 2;
 
     var outer = dvui.box(@src(), .{ .dir = .horizontal }, .{
         .expand = .both,
@@ -356,30 +356,31 @@ fn frame() !dvui.App.Result {
         // Manual button composition (mirrors dvui.buttonIcon): the 32px box
         // keeps the hit area, but the glyph renders at icon_px so it tracks
         // the workspace number size instead of filling the button.
-        var nbtn: dvui.ButtonWidget = undefined;
-        nbtn.init(@src(), .{
-            .draw_focus = false,
-        }, .{
-            .color_fill = t.color(.content, .fill),
-            .corners = .all(10),
-            .padding = .all(0),
-            .min_size_content = .{ .w = 32, .h = 32 },
-            .max_size_content = .{ .w = 32, .h = 32 },
-            .gravity_y = 0.5,
-        });
-        defer nbtn.deinit();
-        nbtn.processEvents();
-        nbtn.drawBackground();
-        if (net_crisp) |c| {
-            _ = dvui.image(@src(), Icons.pixelImage(c), .{
-                .gravity_x = 0.5,
+        {
+            var nbtn: dvui.ButtonWidget = undefined;
+            nbtn.init(@src(), .{
+                .draw_focus = false,
+            }, .{
+                .color_fill = t.color(.content, .fill),
+                .corners = .all(10),
+                .padding = .all(0),
+                .min_size_content = .{ .w = 32, .h = 32 },
+                .max_size_content = .{ .w = 32, .h = 32 },
                 .gravity_y = 0.5,
-                .min_size_content = .{ .w = icon_px, .h = icon_px },
-                .expand = .none,
             });
+            defer nbtn.deinit();
+            nbtn.processEvents();
+            nbtn.drawBackground();
+            if (net_crisp) |c| {
+                _ = dvui.image(@src(), Icons.pixelImage(c), .{
+                    .gravity_x = 0.5,
+                    .gravity_y = 0.5,
+                    .min_size_content = .{ .w = icon_px, .h = icon_px },
+                    .expand = .none,
+                });
+            }
+            if (nbtn.clicked()) toggleNetworkMenu();
         }
-        if (nbtn.clicked()) toggleNetworkMenu();
-        nbtn.drawFocus();
 
         // Link use: down/up rates while a route exists. Hidden offline so
         // the globe_off state stays uncluttered.
@@ -432,7 +433,6 @@ fn frame() !dvui.App.Result {
                 });
             }
             if (bbtn.clicked()) state.notif.clear();
-            bbtn.drawFocus();
             const n_unread = state.notif.count();
             if (n_unread > 0) {
                 var nbuf: [16]u8 = undefined;

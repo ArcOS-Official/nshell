@@ -480,6 +480,32 @@ pub fn animFrac(start_ms: u64, now_ms: u64) f32 {
     return dvui.easing.outQuart(@as(f32, @floatFromInt(el)) / @as(f32, @floatFromInt(net_anim_ms)));
 }
 
+// Activity-indicator breathe: same curve as the size changers
+// (outQuart), 0.1s per color transition, 3% brightness swing. Each 1s
+// loop holds dim, eases dim->bright (+3) over 0.1s, holds bright, then
+// eases back — so the blink reads as a subtle breathe instead of a
+// snap. Pure function of the wall clock (no per-icon animation state),
+// headless-testable like animFrac. Takes the wall-clock ms as u64 so
+// phase is computed with integer modulo BEFORE any f32 conversion:
+// converting the full epoch ms to f32 first quantizes away the
+// fractional phase and freezes the pulse.
+pub const indicator_period_ms: u64 = 1000;
+pub const indicator_trans_ms: u64 = 300;
+pub const indicator_brighten: f32 = 6.0;
+
+pub fn indicatorAmt(now_ms: u64) f32 {
+    const phase = now_ms % indicator_period_ms;
+    const hold_ms = indicator_period_ms / 2 - indicator_trans_ms; // 400
+    if (phase < hold_ms) return 0;
+    if (phase < hold_ms + indicator_trans_ms) {
+        const t = @as(f32, @floatFromInt(phase - hold_ms)) / @as(f32, @floatFromInt(indicator_trans_ms));
+        return indicator_brighten * dvui.easing.outQuart(t);
+    }
+    if (phase < hold_ms + indicator_trans_ms + hold_ms) return indicator_brighten;
+    const t = @as(f32, @floatFromInt(phase - (hold_ms + indicator_trans_ms + hold_ms))) / @as(f32, @floatFromInt(indicator_trans_ms));
+    return indicator_brighten * (1.0 - dvui.easing.outQuart(t));
+}
+
 // macOS-style activity spinner: 12 thick spokes around a circle, lit
 // head with fading tail, ~1 rev/sec. Generic over rect/color so the
 // headless test builds (which never instantiate hubFrame) skip dvui
@@ -667,15 +693,16 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
         // While a track plays the seek bar interpolates locally, but it
         // still needs frames to advance: tick hot at 4fps. Paused/stopped
         // falls back to the loop's normal input-driven wakeups. Active
-        // activity indicators breathe on a sine loop, so they need frames
-        // too — hotter (10fps) so the glide stays smooth.
+        // activity indicators breathe on the hub curve (0.1s eased edges),
+        // so they need frames too — ~30fps so the short glide stays
+        // smooth.
         var hot_us: ?i32 = null;
         if (want_media and (self.hubmode == .clock or self.hubmode == .controls)) {
             var msnap_hot = state.media.snapshotCopy(state.alloc);
             defer msnap_hot.deinit(state.alloc);
             if (msnap_hot.status == .playing) hot_us = 250_000;
         }
-        if (n_ind > 0 and (self.hubmode == .clock or self.hubmode == .controls)) hot_us = 100_000;
+        if (n_ind > 0 and (self.hubmode == .clock or self.hubmode == .controls)) hot_us = 33_333;
         if (hot_us) |micros| {
             if (dvui.timerDone(self.anim_id)) {
                 dvui.timer(self.anim_id, micros);
@@ -2275,11 +2302,13 @@ pub fn tophubBase(self: *HubUi, state: *State, t: *dvui.Theme, id_extra: usize) 
 
 // Activity indicators on the left of the clock strip: recording (red),
 // screenshare (green), camera/mic use (blue), downloads (light gray).
-// Each glyph breathes lighter->darker on a smooth sine loop (no per-icon
-// animation state: the tint is a pure function of the wall clock, and
-// hubFrame keeps frames coming while any indicator is live). The pill
-// widens 30px per indicator (see targetForFull); the clock column keeps
-// its width so the face never shifts when indicators come and go.
+// Each glyph breathes dim<->bright on the hub curve (outQuart, 0.1s per
+// transition, +3 brightness at the bright end — see indicatorAmt): no
+// per-icon animation state, the tint is a pure function of the wall
+// clock, and hubFrame keeps frames coming while any indicator is live.
+// The pill widens 30px per indicator (see targetForFull); the clock
+// column keeps its width so the face never shifts when indicators come
+// and go.
 fn activityStrip(self: *HubUi, state: *State, id_extra: usize) void {
     _ = self;
     const c = state.activity.counts();
@@ -2292,24 +2321,28 @@ fn activityStrip(self: *HubUi, state: *State, id_extra: usize) void {
         .tag = "tophub_activity",
     });
     defer row.deinit();
-    // Sine pulse, 1.5s loop: lighten amount glides between -12 and +14
-    // instead of snapping, so the blink reads as a breathe.
     const ms: i64 = std.Io.Clock.real.now(state.io).toMilliseconds();
-    const t_s = @as(f32, @floatFromInt(ms)) / 1000.0;
-    const amt = 1.0 + @sin(t_s * std.math.pi * 2.0 / 1.5) * 13.0;
-    const glyph_px: f32 = 20;
+    // Integer phase first (see indicatorAmt): u64 epoch ms stays exact
+    // through the modulo, so the pulse actually advances. Quantize to
+    // 0.5 steps so the per-frame tint bake in Icons.iconPx reuses a
+    // handful of cached rasters instead of growing one per frame.
+    const amt_raw = indicatorAmt(@as(u64, @intCast(ms)));
+    const amt = @round(amt_raw * 2.0) / 2.0;
+
+    const glyph_px: f32 = 16;
     // Order on the strip: record, share, camera, mic, download. One slot
     // per live indicator (not per kind): two concurrent shares show two
     // blinking glyphs. Icons stay comptime-selected per branch (tabler
     // embeds only referenced icons).
     const counts = [_]usize{ c.record, c.share, c.camera, c.mic, c.download };
     var shown: usize = 0;
+    const t = dvui.themeGet();
     for (counts, 0..) |n_kind, ki| {
         const base: dvui.Color = switch (ki) {
-            0 => dvui.Color.red,
-            1 => dvui.Color.green,
-            2, 3 => dvui.Color.blue,
-            else => dvui.Color.gray,
+            0 => t.color(.err, .fill).lighten(-10),
+            1 => dvui.Color.green.lighten(-5),
+            2, 3 => t.color(.highlight, .fill).lighten(-10),
+            else => dvui.Color.gray.lighten(-5),
         };
         const tint = base.lighten(amt);
         var j: usize = 0;
@@ -2324,9 +2357,11 @@ fn activityStrip(self: *HubUi, state: *State, id_extra: usize) void {
             if (crisp) |ci| {
                 _ = dvui.image(@src(), Icons.pixelImage(ci), .{
                     .gravity_y = 0.5,
-                    .min_size_content = .{ .w = 24, .h = 24 },
-                    .max_size_content = .{ .w = 24, .h = 24 },
+                    .min_size_content = .{ .w = glyph_px, .h = glyph_px },
+                    .max_size_content = .{ .w = glyph_px, .h = glyph_px },
+                    .padding = .all(10),
                     .id_extra = id_extra * 100 + ki * 10 + j,
+                    .expand = .none,
                 });
             }
             shown += 1;
