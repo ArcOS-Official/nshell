@@ -64,6 +64,7 @@ fn pumpEvents(backend_bar: anytype, win_bar: anytype, backend_hub: anytype, win_
 const LayerShellWindow = @typeInfo(@TypeOf(ls.initWindow)).@"fn".return_type.?;
 
 var win_hub_g: *dvui.Window = undefined;
+var win_bar_g: *dvui.Window = undefined;
 
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
@@ -128,6 +129,9 @@ pub fn main(init: std.process.Init) !u8 {
     });
     win_bar.open_flag = &bar_open;
     defer win_bar.deinit();
+    // Fallback wakeup below refreshes both windows so live bar values
+    // (speed, battery, bell count) converge without input events.
+    win_bar_g = &win_bar;
 
     var hub_open = true;
     var win_hub = try dvui.Window.init(@src(), gpa, backend_hub.backend(), .{
@@ -157,11 +161,14 @@ pub fn main(init: std.process.Init) !u8 {
                 // Fallback wakeup on the shared Net cadence: worker pushes
                 // already wake the loop on change, but snapshots also need
                 // to flow (and spinners/animations need frames) when
-                // nothing pushes. Matches HubUi's steady panel timer.
+                // nothing pushes. Matches HubUi's steady panel timer. Both
+                // windows refresh: the bar carries live speed/battery/bell
+                // values that would otherwise stale between input events.
                 io_.sleep(.fromMilliseconds(@intCast(State.Net.refresh_ms)), .awake) catch {
                     return;
                 };
                 dvui.refresh(win_hub_g, @src(), null);
+                dvui.refresh(win_bar_g, @src(), null);
             }
         }
     }.refresh, .{io});
@@ -294,31 +301,57 @@ fn frame() !dvui.App.Result {
     {
         var right = dvui.box(
             @src(),
-            .{ .dir = .horizontal, .equal_space = true },
+            .{ .dir = .horizontal },
             .{
                 .background = true,
                 .color_fill = t.color(.content, .fill),
                 .color_border = t.color(.content, .text).opacity(0.15),
                 .border = .all(1),
                 .corners = .all(10),
-                .min_size_content = .{ .h = 48.0, .w = (32 * 9) + (6 * 7) },
-                .padding = .fromSize(.{ .w = 4 }),
+                .min_size_content = .{ .h = 48.0 },
+                .padding = .fromSize(.{ .w = 8 }),
                 .gravity_y = 0.5,
             },
         );
         defer right.deinit();
 
         const nst = state.net.status();
+        const pst = state.power.status();
+        const small = t.font_body.withSize(10.0);
         // One comptime call per icon (not a runtime-selected enum): tabler
         // embeds only referenced icons, so the selection stays explicit.
         // Aliased 1-bit raster (see Icons): rasterize at the display size,
         // show 1:1 with nearest sampling.
+
+        // Bluetooth: hidden without an adapter, dimmed when off.
+        if (nst.bt_present) {
+            const bt_tint: dvui.Color = if (nst.bt_powered) .white else t.color(.content, .text).opacity(0.35);
+            if (Icons.iconPx(.bluetooth, icon_px, bt_tint) catch null) |c| {
+                _ = dvui.image(@src(), Icons.pixelImage(c), .{
+                    .gravity_y = 0.5,
+                    .min_size_content = .{ .w = 32, .h = 32 },
+                    .expand = .none,
+                });
+            }
+            _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8 } });
+        }
+
+        // Link state: globe on ethernet, globe_off with no router, wifi
+        // bars otherwise — yellowed when linked but offline (same state
+        // as the control-center alert). The button opens the network menu.
+        const online = State.Net.online(nst.connectivity);
         const net_crisp: ?Icons.Crisp = if (nst.eth_up)
-            Icons.iconPx(.network, icon_px, .white) catch null
-        else if (nst.wifi_on)
-            Icons.iconPx(.wifi, icon_px, .white) catch null
+            Icons.iconPx(.globe, icon_px, .white) catch null
+        else if (nst.connected)
+            switch (State.Net.barsForStrength(nst.strength)) {
+                0 => Icons.iconPx(.wifi_off, icon_px, .white) catch null,
+                1 => Icons.iconPx(.wifi_0, icon_px, if (online) .white else .yellow) catch null,
+                2 => Icons.iconPx(.wifi_1, icon_px, if (online) .white else .yellow) catch null,
+                3 => Icons.iconPx(.wifi_2, icon_px, if (online) .white else .yellow) catch null,
+                else => Icons.iconPx(.wifi, icon_px, if (online) .white else .yellow) catch null,
+            }
         else
-            Icons.iconPx(.wifi_off, icon_px, .white) catch null;
+            Icons.iconPx(.globe_off, icon_px, t.color(.content, .text).opacity(0.5)) catch null;
 
         // Manual button composition (mirrors dvui.buttonIcon): the 32px box
         // keeps the hit area, but the glyph renders at icon_px so it tracks
@@ -347,6 +380,95 @@ fn frame() !dvui.App.Result {
         }
         if (nbtn.clicked()) toggleNetworkMenu();
         nbtn.drawFocus();
+
+        // Link use: down/up rates while a route exists. Hidden offline so
+        // the globe_off state stays uncluttered.
+        if (nst.eth_up or nst.connected) {
+            _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8 } });
+            var dbuf: [32]u8 = undefined;
+            var ubuf: [32]u8 = undefined;
+            const dtxt = State.Net.formatSpeed(&dbuf, nst.down_bps);
+            const utxt = State.Net.formatSpeed(&ubuf, nst.up_bps);
+            if (Icons.iconPx(.arrow_down, 14, t.color(.content, .text).opacity(0.7)) catch null) |c| {
+                _ = dvui.image(@src(), Icons.pixelImage(c), .{
+                    .gravity_y = 0.5,
+                    .min_size_content = .{ .w = 14, .h = 14 },
+                    .expand = .none,
+                });
+            }
+            dvui.labelNoFmt(@src(), dtxt, .{}, .{ .font = small, .gravity_y = 0.5 });
+            if (Icons.iconPx(.arrow_up, 14, t.color(.content, .text).opacity(0.7)) catch null) |c| {
+                _ = dvui.image(@src(), Icons.pixelImage(c), .{
+                    .gravity_y = 0.5,
+                    .min_size_content = .{ .w = 14, .h = 14 },
+                    .expand = .none,
+                });
+            }
+            dvui.labelNoFmt(@src(), utxt, .{}, .{ .font = small, .gravity_y = 0.5 });
+        }
+
+        // Notifications: bell plus unread count; clicking clears (stub
+        // behavior until a daemon feed lands — see Notif.zig).
+        {
+            _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8 } });
+            var bbtn: dvui.ButtonWidget = undefined;
+            bbtn.init(@src(), .{ .draw_focus = false }, .{
+                .color_fill = t.color(.content, .fill),
+                .corners = .all(10),
+                .padding = .all(0),
+                .min_size_content = .{ .w = 32, .h = 32 },
+                .max_size_content = .{ .w = 32, .h = 32 },
+                .gravity_y = 0.5,
+            });
+            defer bbtn.deinit();
+            bbtn.processEvents();
+            bbtn.drawBackground();
+            if (Icons.iconPx(.bell, icon_px, .white) catch null) |c| {
+                _ = dvui.image(@src(), Icons.pixelImage(c), .{
+                    .gravity_x = 0.5,
+                    .gravity_y = 0.5,
+                    .min_size_content = .{ .w = icon_px, .h = icon_px },
+                    .expand = .none,
+                });
+            }
+            if (bbtn.clicked()) state.notif.clear();
+            bbtn.drawFocus();
+            const n_unread = state.notif.count();
+            if (n_unread > 0) {
+                var nbuf: [16]u8 = undefined;
+                const ntxt = std.fmt.bufPrint(&nbuf, "{d}", .{n_unread}) catch "?";
+                dvui.labelNoFmt(@src(), ntxt, .{}, .{ .font = small, .gravity_y = 0.5 });
+            }
+        }
+
+        // Battery: hidden without one (desktop). Idle shows the level
+        // icon in text color; charging greens with the charging icon;
+        // under 5% reds with the need-charge icon.
+        if (pst.present) {
+            _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8 } });
+            const batt: ?Icons.Crisp = if (pst.charging)
+                Icons.iconPx(.battery_charging, icon_px, dvui.Color.green) catch null
+            else if (pst.percent < 5)
+                Icons.iconPx(.battery_charging_2, icon_px, dvui.Color.red) catch null
+            else if (pst.percent < 25)
+                Icons.iconPx(.battery_1, icon_px, .white) catch null
+            else if (pst.percent < 50)
+                Icons.iconPx(.battery_2, icon_px, .white) catch null
+            else if (pst.percent < 75)
+                Icons.iconPx(.battery_3, icon_px, .white) catch null
+            else
+                Icons.iconPx(.battery_4, icon_px, .white) catch null;
+            if (batt) |c| {
+                _ = dvui.image(@src(), Icons.pixelImage(c), .{
+                    .gravity_y = 0.5,
+                    .min_size_content = .{ .w = icon_px, .h = icon_px },
+                    .expand = .none,
+                });
+            }
+            var pbuf: [8]u8 = undefined;
+            const ptxt = std.fmt.bufPrint(&pbuf, "{d}%", .{pst.percent}) catch "?";
+            dvui.labelNoFmt(@src(), ptxt, .{}, .{ .font = small, .gravity_y = 0.5 });
+        }
     }
 
     return .ok;
