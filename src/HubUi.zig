@@ -155,15 +155,28 @@ pub fn targetFor(mode: HubMode) dvui.Size {
 // Sized to hug the content so the expanding text column can't leave a
 // void at the end of the pill. The control center keeps the whole
 // clock (with its player extension) attached at the top, so it is taller.
+//
+// Activity indicators (recording/share/camera/mic/download) hang on the
+// right of the clock strip, 30px each: targetForFull adds that budget.
+pub const indicator_px: f32 = 30;
+
 pub fn targetForMedia(mode: HubMode, has_media: bool) dvui.Size {
-    return switch (mode) {
-        .windows => .{ .w = 600, .h = 120 },
-        .launcher => .{ .w = 520, .h = 360 },
-        .network => .{ .w = 520, .h = 420 },
-        .clock => if (has_media) .{ .w = 444, .h = 50 } else .{ .w = 150, .h = 50 },
-        .controls => .{ .w = 520, .h = 412 },
-        else => .{ .w = 480, .h = 180 },
+    return targetForFull(mode, has_media, 0);
+}
+
+pub fn targetForFull(mode: HubMode, has_media: bool, n_indicators: usize) dvui.Size {
+    var s = switch (mode) {
+        .windows => dvui.Size{ .w = 600, .h = 120 },
+        .launcher => dvui.Size{ .w = 520, .h = 360 },
+        .network => dvui.Size{ .w = 520, .h = 420 },
+        .clock => if (has_media) dvui.Size{ .w = 444, .h = 50 } else dvui.Size{ .w = 150, .h = 50 },
+        .controls => dvui.Size{ .w = 520, .h = 412 },
+        else => dvui.Size{ .w = 480, .h = 180 },
     };
+    if ((mode == .clock or mode == .controls) and n_indicators > 0) {
+        s.w += @as(f32, @floatFromInt(n_indicators)) * indicator_px;
+    }
+    return s;
 }
 
 // Open the network panel from the control center with a fade: the
@@ -304,7 +317,12 @@ pub fn switchMode(self: *HubUi, mode: HubMode, state: *State) void {
         self.last_hubmode = mode;
     }
     self.hubmode = mode;
-    self.setTarget(targetForMedia(mode, state.media.active()));
+    self.setTarget(targetForFull(mode, state.media.active(), indicatorCount(state)));
+}
+
+/// Live activity-indicator count for pill sizing (no allocation).
+fn indicatorCount(state: *State) usize {
+    return state.activity.counts().total();
 }
 
 fn clearNetSel(self: *HubUi, state: *State) void {
@@ -635,18 +653,21 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
         self.toggleNetworkMenu(state);
     }
 
-    // Media-driven hub resize: when a player appears/disappears while the
-    // clock or control center is open, converge on the matching size.
-    // setTarget is a no-op when the size already matches, so running this
-    // every frame is free. Other panels override entirely (no clock).
+    // Media/activity-driven hub resize: when a player or an activity
+    // indicator appears/disappears while the clock or control center is
+    // open, converge on the matching size. setTarget is a no-op when the
+    // size already matches, so running this every frame is free. Other
+    // panels override entirely (no clock).
     {
         const want_media = state.media.active();
+        const n_ind = if (self.hubmode == .clock or self.hubmode == .controls) indicatorCount(state) else 0;
         if (self.hubmode == .clock or self.hubmode == .controls) {
-            self.setTarget(targetForMedia(self.hubmode, want_media));
+            self.setTarget(targetForFull(self.hubmode, want_media, n_ind));
         }
         // While a track plays the seek bar interpolates locally, but it
         // still needs frames to advance: tick hot at 4fps. Paused/stopped
-        // falls back to the loop's normal input-driven wakeups.
+        // falls back to the loop's normal input-driven wakeups. Active
+        // activity indicators blink on a 1s loop, so they need frames too.
         if (want_media and (self.hubmode == .clock or self.hubmode == .controls)) {
             var msnap_hot = state.media.snapshotCopy(state.alloc);
             defer msnap_hot.deinit(state.alloc);
@@ -656,6 +677,13 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
                 } else if (dvui.timerGet(self.anim_id) == null) {
                     dvui.timer(self.anim_id, 250_000);
                 }
+            }
+        }
+        if (n_ind > 0 and (self.hubmode == .clock or self.hubmode == .controls)) {
+            if (dvui.timerDone(self.anim_id)) {
+                dvui.timer(self.anim_id, 250_000);
+            } else if (dvui.timerGet(self.anim_id) == null) {
+                dvui.timer(self.anim_id, 250_000);
             }
         }
     }
@@ -1547,6 +1575,21 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
                                     .padding = .all(4),
                                     .gravity_y = 0.5,
                                 });
+                                // Linked to this AP but no internet behind
+                                // it: yellow alert next to the name (same
+                                // state as the yellowed bar/card wifi
+                                // icons); hovering explains.
+                                if (is_connected and !State.Net.online(snap.connectivity)) {
+                                    if (Icons.iconPx(.alert_small, 18, dvui.Color.yellow) catch null) |alert| {
+                                        const aw = dvui.image(@src(), Icons.pixelImage(alert), .{
+                                            .gravity_y = 0.5,
+                                            .min_size_content = .{ .w = 18, .h = 18 },
+                                            .max_size_content = .{ .w = 18, .h = 18 },
+                                            .id_extra = @as(usize, @truncate(conn.id)),
+                                        });
+                                        dvui.tooltip(@src(), .{ .active_rect = aw.borderRectScale().r }, "connected with no internet", .{}, .{});
+                                    }
+                                }
                                 //macOS-style activity spinner while this row has
                                 // a request in flight. Drawn manually (dvui's
                                 // stock spinner is an arc, not spokes).
@@ -1980,9 +2023,13 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
                     // render at identical sizes (24 content + 12 badge
                     // padding = a 36px circle).
                     const glyph_px: f32 = 24;
+                    // Linked but offline: yellow the wifi glyph, matching
+                    // the bar icon and the row alert below.
+                    const no_net = i == 0 and snap.connected != 0 and !State.Net.online(snap.connectivity);
+                    const glyph_tint = if (no_net) dvui.Color.yellow else t.color(.content, .text);
                     const icon = try if (i == 0)
                         if (snap.wifi_supported)
-                            Icons.iconPx(.wifi, glyph_px, t.color(.content, .text))
+                            Icons.iconPx(.wifi, glyph_px, glyph_tint)
                         else
                             Icons.iconPx(.network, glyph_px, t.color(.content, .text))
                     else
@@ -2053,11 +2100,127 @@ pub fn hubFrame(self: *HubUi, state: *State, _io: std.Io, ctx_hub_g: anytype, _w
                     });
                 }
             }
+            self.activitySection(state, t);
         },
         .search => self.switchMode(.launcher, state),
     }
 
     return .ok;
+}
+
+// Control-center activity section: one row per live capture/mic/camera
+// stream and download, each with its force-stop. Compositor sessions
+// revoke through the shell protocol (State action, acked with pong);
+// PipeWire streams queue a `pw-cli destroy` on the worker; downloads
+// can't be cancelled from outside the browser, so they get an Open-folder
+// button instead. Renders nothing when idle and no notifications wait.
+fn activitySection(self: *HubUi, state: *State, t: *dvui.Theme) void {
+    _ = self;
+    var act = state.activity.snapshotCopy(state.alloc);
+    defer act.deinit(state.alloc);
+    const n_notif = state.notif.count();
+    if (act.items.len == 0 and n_notif == 0) return;
+
+    var sect = dvui.box(@src(), .{ .dir = .vertical }, .{
+        .expand = .horizontal,
+        .background = true,
+        .color_fill = t.color(.content, .fill).lighten(5),
+        .corners = .all(10),
+        .padding = .all(8),
+        .margin = .{ .x = 4, .y = 8, .w = 4, .h = 0 },
+    });
+    defer sect.deinit();
+    dvui.labelNoFmt(@src(), "Activity", .{}, .{
+        .font = t.font_heading.withSize(10),
+        .gravity_x = 0.0,
+    });
+    for (act.items, 0..) |*it, i| {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .expand = .horizontal,
+            .background = false,
+            .gravity_y = 0.5,
+            .id_extra = i,
+        });
+        defer row.deinit();
+        const tint: dvui.Color = switch (it.kind) {
+            .record => dvui.Color.red,
+            .share => dvui.Color.green,
+            .mic, .camera => dvui.Color.blue,
+            .download => t.color(.content, .text).lighten(-10),
+        };
+        const crisp: ?Icons.Crisp = switch (it.kind) {
+            .record => Icons.iconPx(.player_record, 20, tint) catch null,
+            .share => Icons.iconPx(.screen_share, 20, tint) catch null,
+            .camera => Icons.iconPx(.camera, 20, tint) catch null,
+            .mic => Icons.iconPx(.microphone, 20, tint) catch null,
+            .download => Icons.iconPx(.download, 20, tint) catch null,
+        };
+        if (crisp) |ci| {
+            _ = dvui.image(@src(), Icons.pixelImage(ci), .{
+                .gravity_y = 0.5,
+                .min_size_content = .{ .w = 20, .h = 20 },
+                .max_size_content = .{ .w = 20, .h = 20 },
+                .id_extra = i,
+            });
+        }
+        _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8 } });
+        dvui.labelNoFmt(@src(), it.label, .{}, .{
+            .font = t.font_body.withSize(11.0),
+            .expand = .horizontal,
+            .gravity_y = 0.5,
+        });
+        if (it.detail.len > 0) {
+            dvui.labelNoFmt(@src(), it.detail, .{}, .{
+                .font = t.font_body.withSize(10.0),
+                .color_text = t.color(.content, .text).opacity(0.6),
+                .gravity_y = 0.5,
+            });
+            _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8 } });
+        }
+        switch (it.source) {
+            .compositor => {
+                if (dvui.button(@src(), "Stop", .{}, .{ .id_extra = i, .gravity_y = 0.5 })) {
+                    state.req_q.push(state.alloc, state.io, .{ .revoke_capture_session = .{ .id = it.stop_id } });
+                }
+            },
+            .pipewire => {
+                if (dvui.button(@src(), "Stop", .{}, .{ .id_extra = i, .gravity_y = 0.5 })) {
+                    state.activity.requestStop(.pipewire, it.stop_id);
+                }
+            },
+            .downloads => {
+                if (dvui.button(@src(), "Open folder", .{}, .{ .id_extra = i, .gravity_y = 0.5 })) {
+                    state.activity.openDownloads();
+                }
+            },
+        }
+    }
+    if (n_notif > 0) {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .expand = .horizontal,
+            .background = false,
+            .gravity_y = 0.5,
+        });
+        defer row.deinit();
+        if (Icons.iconPx(.bell, 20, t.color(.content, .text)) catch null) |ci| {
+            _ = dvui.image(@src(), Icons.pixelImage(ci), .{
+                .gravity_y = 0.5,
+                .min_size_content = .{ .w = 20, .h = 20 },
+                .max_size_content = .{ .w = 20, .h = 20 },
+            });
+        }
+        _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8 } });
+        var nbuf: [32]u8 = undefined;
+        const ntxt = std.fmt.bufPrint(&nbuf, "{d} unread", .{n_notif}) catch "?";
+        dvui.labelNoFmt(@src(), ntxt, .{}, .{
+            .font = t.font_body.withSize(11.0),
+            .expand = .horizontal,
+            .gravity_y = 0.5,
+        });
+        if (dvui.button(@src(), "Clear", .{}, .{ .gravity_y = 0.5 })) {
+            state.notif.clear();
+        }
+    }
 }
 
 // Shared top strip — the whole clock hub as one row: fixed 132px clock
@@ -2109,7 +2272,68 @@ pub fn tophubBase(self: *HubUi, state: *State, t: *dvui.Theme, id_extra: usize) 
         self.clockLabels(state, t, !show_player);
     }
     if (show_player) self.media_clicked = self.clockPlayer(state, t, msnap.?, id_extra);
+    self.activityStrip(state, id_extra);
     return show_player;
+}
+
+// Activity indicators on the right of the clock strip: recording (red),
+// screenshare (green), camera/mic use (blue), downloads (light gray).
+// Blinking loops lighter->darker on a 1s wall-clock phase (hubFrame keeps
+// frames coming while any indicator is live, so no per-icon animation
+// state is needed). The pill widens 30px per indicator (see
+// targetForFull); the clock column keeps its width so the face never
+// shifts when indicators come and go.
+fn activityStrip(self: *HubUi, state: *State, id_extra: usize) void {
+    _ = self;
+    const c = state.activity.counts();
+    const n = c.total();
+    if (n == 0) return;
+    _ = dvui.spacer(@src(), .{ .expand = .horizontal, .id_extra = id_extra });
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+        .background = false,
+        .gravity_y = 0.5,
+        .id_extra = id_extra,
+        .tag = "tophub_activity",
+    });
+    defer row.deinit();
+    const ms: i64 = std.Io.Clock.real.now(state.io).toMilliseconds();
+    const bright = @mod(@divTrunc(ms, 500), 2) == 0;
+    const glyph_px: f32 = 20;
+    // Order on the strip: record, share, camera, mic, download. One slot
+    // per live indicator (not per kind): two concurrent shares show two
+    // blinking glyphs. Icons stay comptime-selected per branch (tabler
+    // embeds only referenced icons).
+    const counts = [_]usize{ c.record, c.share, c.camera, c.mic, c.download };
+    var shown: usize = 0;
+    for (counts, 0..) |n_kind, ki| {
+        const base: dvui.Color = switch (ki) {
+            0 => dvui.Color.red,
+            1 => dvui.Color.green,
+            2, 3 => dvui.Color.blue,
+            else => dvui.Color.gray,
+        };
+        const tint = if (bright) base.lighten(14) else base.lighten(-12);
+        var j: usize = 0;
+        while (j < n_kind) : (j += 1) {
+            const crisp: ?Icons.Crisp = switch (ki) {
+                0 => Icons.iconPx(.player_record, glyph_px, tint) catch null,
+                1 => Icons.iconPx(.screen_share, glyph_px, tint) catch null,
+                2 => Icons.iconPx(.camera, glyph_px, tint) catch null,
+                3 => Icons.iconPx(.microphone, glyph_px, tint) catch null,
+                else => Icons.iconPx(.download, glyph_px, tint) catch null,
+            };
+            if (crisp) |ci| {
+                _ = dvui.image(@src(), Icons.pixelImage(ci), .{
+                    .gravity_y = 0.5,
+                    .min_size_content = .{ .w = 24, .h = 24 },
+                    .max_size_content = .{ .w = 24, .h = 24 },
+                    .id_extra = id_extra * 100 + ki * 10 + j,
+                });
+            }
+            shown += 1;
+            if (shown < n) _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 6 } });
+        }
+    }
 }
 
 // Clock face shared by the clock hub and the control-center header:
